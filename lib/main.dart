@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:file_selector/file_selector.dart';
 
 import 'src/visual_frame_codec.dart';
 import 'src/visual_protocol.dart';
@@ -122,30 +123,17 @@ class _SenderPanelState extends State<SenderPanel> {
   }
 
   Future<void> _browseInputFile() async {
-    if (!Platform.isWindows) {
+    try {
+      final XFile? picked = await openFile();
+      if (picked != null) {
+        setState(() {
+          _filePathController.text = picked.path;
+          _message = '';
+        });
+      }
+    } catch (e) {
       setState(() {
-        _message = '当前环境不是 Windows，请手动输入文件路径。';
-      });
-      return;
-    }
-
-    const String script = r'''
-Add-Type -AssemblyName System.Windows.Forms
-$dlg = New-Object System.Windows.Forms.OpenFileDialog
-$dlg.Multiselect = $false
-if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  Write-Output $dlg.FileName
-}
-''';
-    final ProcessResult result = await Process.run('powershell', <String>[
-      '-NoProfile',
-      '-Command',
-      script,
-    ], runInShell: true);
-    final String picked = (result.stdout ?? '').toString().trim();
-    if (picked.isNotEmpty) {
-      setState(() {
-        _filePathController.text = picked;
+        _message = '打开文件选择器失败: $e';
       });
     }
   }
@@ -432,16 +420,23 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   int _totalDataChunks = 0;
   int _decodedFrames = 0;
   int _validFrames = 0;
+  int _invalidFrames = 0;
   String _status = '空闲';
   String _lastPacketInfo = '-';
   String _ffmpegLog = '';
   String _savedFilePath = '';
+  Uint8List? _latestCaptureBytes;
+  DateTime? _latestCaptureAt;
 
   @override
   void initState() {
     super.initState();
     _ffmpegController = TextEditingController(text: _defaultFfmpegPath());
     _outputDirController.text = Directory.current.path;
+    Future<void>.delayed(
+      const Duration(milliseconds: 220),
+      _autoDetectDeviceOnLoad,
+    );
   }
 
   @override
@@ -465,25 +460,26 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       return;
     }
     try {
-      final ProcessResult result = await Process.run(ffmpegPath, <String>[
-        '-hide_banner',
-        '-list_devices',
-        'true',
-        '-f',
-        'dshow',
-        '-i',
-        'dummy',
-      ], runInShell: true);
-      final String merged = '${result.stderr}\n${result.stdout}';
-      final List<String> devices = _parseDshowDevices(merged);
+      final _DshowScanResult scanResult = await _scanDshowDevices(ffmpegPath);
+      final _DshowDeviceEntry? guessed = _guessBestCaptureVideoDevice(
+        scanResult.videoDevices,
+        scanResult.audioDevices,
+      );
       setState(() {
-        if (devices.isEmpty) {
+        if (scanResult.videoDevices.isEmpty) {
           _status = '未解析到采集设备，请确认系统识别到了采集卡。';
+        } else if (guessed != null) {
+          _deviceController.text = guessed.name;
+          _status =
+              '扫描到 ${scanResult.videoDevices.length} 个视频设备，已自动选择：${guessed.name}';
         } else {
-          _deviceController.text = devices.first;
-          _status = '扫描到 ${devices.length} 个视频设备。';
+          if (_deviceController.text.trim().isEmpty) {
+            _deviceController.clear();
+          }
+          _status =
+              '扫描到 ${scanResult.videoDevices.length} 个视频设备，但未识别出采集卡，请手动填写。';
         }
-        _ffmpegLog = merged;
+        _ffmpegLog = scanResult.rawOutput;
       });
     } catch (e) {
       setState(() {
@@ -492,29 +488,69 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     }
   }
 
-  Future<void> _pickOutputDir() async {
-    if (!Platform.isWindows) {
-      setState(() {
-        _status = '当前环境不是 Windows，请手动输入输出目录。';
-      });
+  Future<void> _autoDetectDeviceOnLoad() async {
+    if (!mounted || !Platform.isWindows) {
       return;
     }
-    const String script = r'''
-Add-Type -AssemblyName System.Windows.Forms
-$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  Write-Output $dlg.SelectedPath
-}
-''';
-    final ProcessResult result = await Process.run('powershell', <String>[
-      '-NoProfile',
-      '-Command',
-      script,
-    ], runInShell: true);
-    final String selected = (result.stdout ?? '').toString().trim();
-    if (selected.isNotEmpty) {
+    if (_deviceController.text.trim().isNotEmpty) {
+      return;
+    }
+    final String ffmpegPath = _ffmpegController.text.trim();
+    if (ffmpegPath.isEmpty) {
+      return;
+    }
+    try {
+      final _DshowScanResult scanResult = await _scanDshowDevices(ffmpegPath);
+      if (!mounted) {
+        return;
+      }
+      final _DshowDeviceEntry? guessed = _guessBestCaptureVideoDevice(
+        scanResult.videoDevices,
+        scanResult.audioDevices,
+      );
+      if (guessed == null) {
+        setState(() {
+          _ffmpegLog = scanResult.rawOutput;
+        });
+        return;
+      }
       setState(() {
-        _outputDirController.text = selected;
+        _deviceController.text = guessed.name;
+        _ffmpegLog = scanResult.rawOutput;
+        _status = '已自动识别采集设备：${guessed.name}';
+      });
+    } catch (_) {
+      // 自动识别失败时保持静默，不打断手动输入流程。
+    }
+  }
+
+  Future<_DshowScanResult> _scanDshowDevices(String ffmpegPath) async {
+    final String merged = await _runProcessCaptureMergedOutput(
+      ffmpegPath,
+      <String>[
+        '-hide_banner',
+        '-list_devices',
+        'true',
+        '-f',
+        'dshow',
+        '-i',
+        'dummy',
+      ],
+    );
+    return _parseDshowScanResult(merged);
+  }
+
+  Future<void> _pickOutputDir() async {
+    try {
+      final String? selected = await getDirectoryPath();
+      if (selected != null && selected.isNotEmpty) {
+        setState(() {
+          _outputDirController.text = selected;
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _status = '打开目录选择器失败: $e';
       });
     }
   }
@@ -574,9 +610,25 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         captureFile.path,
       ], runInShell: true);
 
-      _captureProcess!.stderr.transform(utf8.decoder).listen((String data) {
+      _captureProcess!.stderr.listen((List<int> data) {
+        final String text = _decodeProcessBytesAuto(data);
+        if (text.isEmpty) {
+          return;
+        }
         setState(() {
-          _ffmpegLog = (_ffmpegLog + data);
+          _ffmpegLog = (_ffmpegLog + text);
+          if (_ffmpegLog.length > 5000) {
+            _ffmpegLog = _ffmpegLog.substring(_ffmpegLog.length - 5000);
+          }
+        });
+      });
+      _captureProcess!.stdout.listen((List<int> data) {
+        final String text = _decodeProcessBytesAuto(data);
+        if (text.isEmpty) {
+          return;
+        }
+        setState(() {
+          _ffmpegLog = (_ffmpegLog + text);
           if (_ffmpegLog.length > 5000) {
             _ffmpegLog = _ffmpegLog.substring(_ffmpegLog.length - 5000);
           }
@@ -613,17 +665,21 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     _decodingBusy = true;
     try {
       final Uint8List bytes = await frameFile.readAsBytes();
+      _latestCaptureBytes = bytes;
+      _latestCaptureAt = modifiedAt;
       _decodedFrames++;
       final List<double>? lumaSamples = await VisualFrameSampler.sampleLuma(
         bytes,
       );
       if (lumaSamples == null) {
+        _invalidFrames++;
         return;
       }
       final DecodedVisualFrame? decoded = VisualFrameDecoder.decodeLumaSamples(
         lumaSamples,
       );
       if (decoded == null) {
+        _invalidFrames++;
         return;
       }
       _validFrames++;
@@ -711,8 +767,11 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     _totalDataChunks = 0;
     _decodedFrames = 0;
     _validFrames = 0;
+    _invalidFrames = 0;
     _lastPacketInfo = '-';
     _savedFilePath = '';
+    _latestCaptureBytes = null;
+    _latestCaptureAt = null;
   }
 
   @override
@@ -840,6 +899,7 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             _kv('数据分片', _totalDataChunks == 0 ? '-' : '$_totalDataChunks'),
             _kv('解码帧', '$_decodedFrames'),
             _kv('有效帧', '$_validFrames'),
+            _kv('无效帧', '$_invalidFrames'),
             _kv('最后包', _lastPacketInfo),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: progress == 0 ? null : progress),
@@ -855,9 +915,72 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   }
 
   Widget _buildReceiverStatus(double progress) {
+    final String captureTime = _latestCaptureAt == null
+        ? '-'
+        : _latestCaptureAt!
+              .toLocal()
+              .toIso8601String()
+              .replaceFirst('T', ' ')
+              .split('.')
+              .first;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  '采集预览',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                _kv('最后截图时间', captureTime),
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: AspectRatio(
+                    aspectRatio: 16 / 9,
+                    child: DecoratedBox(
+                      decoration: const BoxDecoration(color: Color(0xFF0F172A)),
+                      child: _latestCaptureBytes == null
+                          ? const Center(
+                              child: Text(
+                                '尚未采集到截图',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            )
+                          : Stack(
+                              fit: StackFit.expand,
+                              children: <Widget>[
+                                Image.memory(
+                                  _latestCaptureBytes!,
+                                  gaplessPlayback: true,
+                                  fit: BoxFit.contain,
+                                  filterQuality: FilterQuality.none,
+                                ),
+                                IgnorePointer(
+                                  child: CustomPaint(
+                                    painter: _SamplingOverlayPainter(),
+                                  ),
+                                ),
+                              ],
+                            ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  '黄色框为解码采样区域。若此区域未完整覆盖发送端黑白码图，通常会导致无有效帧。',
+                  style: TextStyle(color: Color(0xFF475569), fontSize: 12.5),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(14),
@@ -927,6 +1050,22 @@ String _defaultFfmpegPath() {
   return 'ffmpeg';
 }
 
+class _SamplingOverlayPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final VisualFrameGeometry g = VisualFrameGeometry.fromSize(size);
+    final Rect r = Rect.fromLTWH(g.left, g.top, g.width, g.height);
+    final Paint border = Paint()
+      ..color = const Color(0xFFFBBF24)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+    canvas.drawRect(r, border);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SamplingOverlayPainter oldDelegate) => false;
+}
+
 Widget _kv(String key, String value) {
   return Padding(
     padding: const EdgeInsets.only(bottom: 4),
@@ -975,26 +1114,258 @@ String _sanitizeFileName(String input) {
   return withoutBadChars;
 }
 
-List<String> _parseDshowDevices(String text) {
-  final List<String> devices = <String>[];
-  bool inVideoSection = false;
+class _DshowDeviceEntry {
+  const _DshowDeviceEntry({required this.name, this.alternativeName});
+
+  final String name;
+  final String? alternativeName;
+}
+
+class _DshowScanResult {
+  const _DshowScanResult({
+    required this.videoDevices,
+    required this.audioDevices,
+    required this.rawOutput,
+  });
+
+  final List<_DshowDeviceEntry> videoDevices;
+  final List<_DshowDeviceEntry> audioDevices;
+  final String rawOutput;
+}
+
+_DshowScanResult _parseDshowScanResult(String text) {
+  return _DshowScanResult(
+    videoDevices: _parseDshowSectionEntries(text, 'DirectShow video devices'),
+    audioDevices: _parseDshowSectionEntries(text, 'DirectShow audio devices'),
+    rawOutput: text,
+  );
+}
+
+List<_DshowDeviceEntry> _parseDshowSectionEntries(String text, String marker) {
+  final List<_DshowDeviceEntry> devices = <_DshowDeviceEntry>[];
+  bool inSection = false;
+  int? pendingIndex;
   final RegExp quoted = RegExp(r'"([^"]+)"');
+
   for (final String line in text.split('\n')) {
-    if (line.contains('DirectShow video devices')) {
-      inVideoSection = true;
+    if (line.contains(marker)) {
+      inSection = true;
+      pendingIndex = null;
       continue;
     }
-    if (line.contains('DirectShow audio devices')) {
-      inVideoSection = false;
+    if (!inSection) {
       continue;
     }
-    if (!inVideoSection) {
+    if (line.contains('DirectShow') && !line.contains(marker)) {
+      inSection = false;
+      pendingIndex = null;
       continue;
     }
     final Match? match = quoted.firstMatch(line);
-    if (match != null) {
-      devices.add(match.group(1)!);
+    if (match == null) {
+      continue;
     }
+    final String value = match.group(1)!;
+    if (line.contains('Alternative name')) {
+      if (pendingIndex != null) {
+        final _DshowDeviceEntry prev = devices[pendingIndex];
+        devices[pendingIndex] = _DshowDeviceEntry(
+          name: prev.name,
+          alternativeName: value,
+        );
+      }
+      continue;
+    }
+    devices.add(_DshowDeviceEntry(name: value));
+    pendingIndex = devices.length - 1;
   }
   return devices;
+}
+
+_DshowDeviceEntry? _guessBestCaptureVideoDevice(
+  List<_DshowDeviceEntry> videos,
+  List<_DshowDeviceEntry> audios,
+) {
+  if (videos.isEmpty) {
+    return null;
+  }
+  _DshowDeviceEntry? best;
+  int bestScore = -999;
+  for (final _DshowDeviceEntry video in videos) {
+    final int score = _scoreCaptureDevice(video, audios);
+    if (score > bestScore) {
+      bestScore = score;
+      best = video;
+    }
+  }
+  if (best == null || bestScore < 4) {
+    return null;
+  }
+  return best;
+}
+
+int _scoreCaptureDevice(
+  _DshowDeviceEntry video,
+  List<_DshowDeviceEntry> audios,
+) {
+  final String name = video.name.toLowerCase();
+  final String alt = (video.alternativeName ?? '').toLowerCase();
+  int score = 0;
+
+  const List<String> positiveKeywords = <String>[
+    'capture',
+    'camlink',
+    'cam link',
+    'hdmi',
+    'grabber',
+    'uvc',
+    'usb video',
+    '采集',
+    'lcc',
+    'ezcap',
+    'av to usb',
+    'video converter',
+  ];
+  for (final String keyword in positiveKeywords) {
+    if (name.contains(keyword) || alt.contains(keyword)) {
+      score += 5;
+    }
+  }
+  if (name.contains('camera')) {
+    score += 1;
+  }
+  if (alt.contains('usb#vid_')) {
+    score += 3;
+  }
+
+  const List<String> negativeKeywords = <String>[
+    'integrated',
+    'builtin',
+    'built-in',
+    'facetime',
+    'virtual camera',
+    'obs',
+    'droidcam',
+    'epoccam',
+    'ir camera',
+    'webcam',
+    '内置',
+  ];
+  for (final String keyword in negativeKeywords) {
+    if (name.contains(keyword)) {
+      score -= 5;
+    }
+  }
+
+  final String compactVideoName = _compactDeviceName(name);
+  final String? modelToken = _extractModelToken(name);
+  for (final _DshowDeviceEntry audio in audios) {
+    final String audioName = audio.name.toLowerCase();
+    final String compactAudioName = _compactDeviceName(audioName);
+    if (compactVideoName.isNotEmpty &&
+        compactAudioName.contains(compactVideoName)) {
+      score += 6;
+    }
+    if (modelToken != null && audioName.contains(modelToken)) {
+      score += 8;
+    }
+  }
+  return score;
+}
+
+String _compactDeviceName(String input) {
+  return input.replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fa5]+'), '');
+}
+
+String? _extractModelToken(String input) {
+  final RegExp tokenPattern = RegExp(r'[a-z]{2,}[0-9]{2,}[a-z0-9]*');
+  final Match? match = tokenPattern.firstMatch(input);
+  return match?.group(0);
+}
+
+Future<String> _runProcessCaptureMergedOutput(
+  String executable,
+  List<String> args,
+) async {
+  final Process process = await Process.start(
+    executable,
+    args,
+    runInShell: true,
+  );
+  final List<int> stderrBytes = <int>[];
+  final List<int> stdoutBytes = <int>[];
+  final Completer<void> stderrDone = Completer<void>();
+  final Completer<void> stdoutDone = Completer<void>();
+
+  process.stderr.listen(
+    stderrBytes.addAll,
+    onDone: () => stderrDone.complete(),
+  );
+  process.stdout.listen(
+    stdoutBytes.addAll,
+    onDone: () => stdoutDone.complete(),
+  );
+
+  await process.exitCode;
+  await Future.wait(<Future<void>>[stderrDone.future, stdoutDone.future]);
+
+  final String stderrText = _decodeProcessBytesAuto(stderrBytes);
+  final String stdoutText = _decodeProcessBytesAuto(stdoutBytes);
+  return '$stderrText\n$stdoutText';
+}
+
+String _decodeProcessBytesAuto(List<int> bytes) {
+  if (bytes.isEmpty) {
+    return '';
+  }
+  final String utf8Text = const Utf8Decoder(
+    allowMalformed: true,
+  ).convert(bytes);
+  String systemText;
+  try {
+    systemText = systemEncoding.decode(bytes);
+  } catch (_) {
+    systemText = utf8Text;
+  }
+
+  final int utf8Score = _mojibakeScore(utf8Text);
+  final int systemScore = _mojibakeScore(systemText);
+  if (utf8Score < systemScore) {
+    return utf8Text;
+  }
+  if (systemScore < utf8Score) {
+    return systemText;
+  }
+
+  final bool utf8HasReplacement = utf8Text.contains('\uFFFD');
+  final bool systemHasReplacement = systemText.contains('\uFFFD');
+  if (utf8HasReplacement && !systemHasReplacement) {
+    return systemText;
+  }
+  if (systemHasReplacement && !utf8HasReplacement) {
+    return utf8Text;
+  }
+  return utf8Text;
+}
+
+int _mojibakeScore(String text) {
+  int score = 0;
+  score += '\uFFFD'.allMatches(text).length * 8;
+  const List<String> markers = <String>[
+    '锟',
+    '鏁',
+    '闊',
+    '鏈',
+    '鍙',
+    '鎺',
+    '楹',
+    '閫',
+    '鑻',
+    '鐗',
+    '鎶',
+  ];
+  for (final String m in markers) {
+    score += m.allMatches(text).length;
+  }
+  return score;
 }
