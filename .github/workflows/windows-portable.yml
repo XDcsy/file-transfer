@@ -1,0 +1,56 @@
+name: Build Windows Portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_zip_url:
+        description: "ffmpeg zip URL"
+        required: false
+        default: "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Flutter Version
+        run: flutter --version
+
+      - name: Build Portable Package
+        shell: pwsh
+        run: |
+          $url = "${{ github.event.inputs.ffmpeg_zip_url }}"
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          }
+          powershell -ExecutionPolicy Bypass -File .\tools\package_windows.ps1 -FfmpegZipUrl $url
+
+      - name: Upload Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaptureVisionTransfer-portable-windows
+          path: dist/CaptureVisionTransfer-portable-windows.zip
+          if-no-files-found: error
+
+      - name: Upload Bundle Directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaptureVisionTransfer-directory
+          path: dist/CaptureVisionTransfer
+          if-no-files-found: error
+
+      - name: Publish Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CaptureVisionTransfer-portable-windows.zip
