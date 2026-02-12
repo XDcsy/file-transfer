@@ -423,10 +423,18 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   int _invalidFrames = 0;
   String _status = '空闲';
   String _lastPacketInfo = '-';
-  String _ffmpegLog = '';
   String _savedFilePath = '';
   Uint8List? _latestCaptureBytes;
   DateTime? _latestCaptureAt;
+  int? _latestCaptureWidth;
+  int? _latestCaptureHeight;
+  Rect? _lastDetectedNormalizedRect;
+  final List<_DshowDeviceEntry> _videoDevices = <_DshowDeviceEntry>[];
+  bool _scanningDevices = false;
+  bool _manualRegionEnabled = false;
+  double _manualCenterX = 0.5;
+  double _manualCenterY = 0.5;
+  double _manualWidthFraction = 0.40;
 
   @override
   void initState() {
@@ -435,7 +443,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _outputDirController.text = Directory.current.path;
     Future<void>.delayed(
       const Duration(milliseconds: 220),
-      _autoDetectDeviceOnLoad,
+      () => _scanDevices(silent: true),
     );
   }
 
@@ -451,13 +459,37 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     super.dispose();
   }
 
-  Future<void> _scanDevices() async {
+  String? get _selectedDropdownDevice {
+    final String current = _deviceController.text.trim();
+    if (current.isEmpty) {
+      return null;
+    }
+    for (final _DshowDeviceEntry d in _videoDevices) {
+      if (d.name == current) {
+        return current;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _scanDevices({bool silent = false}) async {
+    if (_scanningDevices) {
+      return;
+    }
     final String ffmpegPath = _ffmpegController.text.trim();
     if (ffmpegPath.isEmpty) {
-      setState(() {
-        _status = '请先填写 ffmpeg 路径。';
-      });
+      if (!silent) {
+        setState(() {
+          _status = '请先填写 ffmpeg 路径。';
+        });
+      }
       return;
+    }
+    _scanningDevices = true;
+    if (!silent) {
+      setState(() {
+        _status = '正在扫描 dshow 设备...';
+      });
     }
     try {
       final _DshowScanResult scanResult = await _scanDshowDevices(ffmpegPath);
@@ -466,61 +498,34 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         scanResult.audioDevices,
       );
       setState(() {
+        _videoDevices
+          ..clear()
+          ..addAll(scanResult.videoDevices);
         if (scanResult.videoDevices.isEmpty) {
-          _status = '未解析到采集设备，请确认系统识别到了采集卡。';
+          _deviceController.clear();
+          if (!silent) {
+            _status = '未解析到采集设备，请确认系统识别到了采集卡。';
+          }
         } else if (guessed != null) {
           _deviceController.text = guessed.name;
           _status =
               '扫描到 ${scanResult.videoDevices.length} 个视频设备，已自动选择：${guessed.name}';
         } else {
-          if (_deviceController.text.trim().isEmpty) {
-            _deviceController.clear();
+          _deviceController.clear();
+          if (!silent) {
+            _status =
+                '扫描到 ${scanResult.videoDevices.length} 个视频设备，但未识别出采集卡，请手动填写。';
           }
-          _status =
-              '扫描到 ${scanResult.videoDevices.length} 个视频设备，但未识别出采集卡，请手动填写。';
         }
-        _ffmpegLog = scanResult.rawOutput;
       });
     } catch (e) {
       setState(() {
-        _status = '扫描设备失败: $e';
+        if (!silent) {
+          _status = '扫描设备失败: $e';
+        }
       });
-    }
-  }
-
-  Future<void> _autoDetectDeviceOnLoad() async {
-    if (!mounted || !Platform.isWindows) {
-      return;
-    }
-    if (_deviceController.text.trim().isNotEmpty) {
-      return;
-    }
-    final String ffmpegPath = _ffmpegController.text.trim();
-    if (ffmpegPath.isEmpty) {
-      return;
-    }
-    try {
-      final _DshowScanResult scanResult = await _scanDshowDevices(ffmpegPath);
-      if (!mounted) {
-        return;
-      }
-      final _DshowDeviceEntry? guessed = _guessBestCaptureVideoDevice(
-        scanResult.videoDevices,
-        scanResult.audioDevices,
-      );
-      if (guessed == null) {
-        setState(() {
-          _ffmpegLog = scanResult.rawOutput;
-        });
-        return;
-      }
-      setState(() {
-        _deviceController.text = guessed.name;
-        _ffmpegLog = scanResult.rawOutput;
-        _status = '已自动识别采集设备：${guessed.name}';
-      });
-    } catch (_) {
-      // 自动识别失败时保持静默，不打断手动输入流程。
+    } finally {
+      _scanningDevices = false;
     }
   }
 
@@ -553,6 +558,33 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         _status = '打开目录选择器失败: $e';
       });
     }
+  }
+
+  void _selectDeviceFromDropdown(String? value) {
+    if (value == null) {
+      return;
+    }
+    setState(() {
+      _deviceController.text = value;
+      _status = '已选择设备：$value';
+    });
+  }
+
+  Rect _manualNormalizedRect() {
+    final double imageAspect =
+        (_latestCaptureWidth != null && _latestCaptureHeight != null)
+        ? (_latestCaptureWidth! / _latestCaptureHeight!)
+        : (16 / 9);
+    final double targetAspect =
+        VisualProtocol.gridCols / VisualProtocol.gridRows;
+    final double w = _manualWidthFraction.clamp(0.08, 0.95);
+    double h = (w * imageAspect / targetAspect).clamp(0.08, 0.95);
+    if (h > 0.95) {
+      h = 0.95;
+    }
+    final double left = (_manualCenterX - w / 2).clamp(0.0, 1.0 - w);
+    final double top = (_manualCenterY - h / 2).clamp(0.0, 1.0 - h);
+    return Rect.fromLTWH(left, top, w, h);
   }
 
   Future<void> _startReceiver() async {
@@ -610,30 +642,8 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         captureFile.path,
       ], runInShell: true);
 
-      _captureProcess!.stderr.listen((List<int> data) {
-        final String text = _decodeProcessBytesAuto(data);
-        if (text.isEmpty) {
-          return;
-        }
-        setState(() {
-          _ffmpegLog = (_ffmpegLog + text);
-          if (_ffmpegLog.length > 5000) {
-            _ffmpegLog = _ffmpegLog.substring(_ffmpegLog.length - 5000);
-          }
-        });
-      });
-      _captureProcess!.stdout.listen((List<int> data) {
-        final String text = _decodeProcessBytesAuto(data);
-        if (text.isEmpty) {
-          return;
-        }
-        setState(() {
-          _ffmpegLog = (_ffmpegLog + text);
-          if (_ffmpegLog.length > 5000) {
-            _ffmpegLog = _ffmpegLog.substring(_ffmpegLog.length - 5000);
-          }
-        });
-      });
+      _captureProcess!.stderr.listen((List<int> _) {});
+      _captureProcess!.stdout.listen((List<int> _) {});
 
       _running = true;
       _status = '接收中，等待有效帧...';
@@ -668,22 +678,33 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       _latestCaptureBytes = bytes;
       _latestCaptureAt = modifiedAt;
       _decodedFrames++;
-      final List<double>? lumaSamples = await VisualFrameSampler.sampleLuma(
-        bytes,
-      );
-      if (lumaSamples == null) {
+      DecodedFrameCandidate? decodedCandidate;
+      if (_manualRegionEnabled) {
+        decodedCandidate = await VisualFrameSampler.decodeAtHint(
+          bytes,
+          centerXFraction: _manualCenterX,
+          centerYFraction: _manualCenterY,
+          widthFraction: _manualWidthFraction,
+        );
+      }
+      decodedCandidate ??= await VisualFrameSampler.decodeBestFrame(bytes);
+      if (decodedCandidate == null) {
         _invalidFrames++;
+        _lastDetectedNormalizedRect = _manualRegionEnabled
+            ? _manualNormalizedRect()
+            : null;
         return;
       }
-      final DecodedVisualFrame? decoded = VisualFrameDecoder.decodeLumaSamples(
-        lumaSamples,
+      _latestCaptureWidth = decodedCandidate.sourceWidth;
+      _latestCaptureHeight = decodedCandidate.sourceHeight;
+      _lastDetectedNormalizedRect = decodedCandidate.geometry.toNormalizedRect(
+        Size(
+          decodedCandidate.sourceWidth.toDouble(),
+          decodedCandidate.sourceHeight.toDouble(),
+        ),
       );
-      if (decoded == null) {
-        _invalidFrames++;
-        return;
-      }
       _validFrames++;
-      _handlePacket(decoded.packet);
+      _handlePacket(decodedCandidate.decoded.packet);
     } finally {
       _decodingBusy = false;
       if (mounted) {
@@ -772,6 +793,9 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _savedFilePath = '';
     _latestCaptureBytes = null;
     _latestCaptureAt = null;
+    _latestCaptureWidth = null;
+    _latestCaptureHeight = null;
+    _lastDetectedNormalizedRect = null;
   }
 
   @override
@@ -783,7 +807,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         builder: (BuildContext context, BoxConstraints constraints) {
           final bool narrow = constraints.maxWidth < 1120;
           final Widget left = _buildReceiverControls(progress);
-          final Widget right = _buildReceiverStatus(progress);
+          final Widget right = _buildReceiverStatus(progress, narrow);
           if (narrow) {
             return ListView(
               children: <Widget>[left, const SizedBox(height: 12), right],
@@ -803,6 +827,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   }
 
   Widget _buildReceiverControls(double progress) {
+    final bool hasDevices = _videoDevices.isNotEmpty;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -820,18 +845,77 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
               decoration: const InputDecoration(labelText: 'ffmpeg 路径'),
             ),
             const SizedBox(height: 10),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: _running ? null : () => _scanDevices(),
+                    icon: const Icon(Icons.search),
+                    label: Text(_scanningDevices ? '扫描中...' : '扫描采集设备'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (hasDevices) ...<Widget>[
+              DropdownButtonFormField<String>(
+                initialValue: _selectedDropdownDevice,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: '扫描结果（视频设备）'),
+                items: _videoDevices
+                    .map(
+                      (_DshowDeviceEntry d) => DropdownMenuItem<String>(
+                        value: d.name,
+                        child: Text(d.name, overflow: TextOverflow.ellipsis),
+                      ),
+                    )
+                    .toList(),
+                onChanged: _running ? null : _selectDeviceFromDropdown,
+              ),
+              const SizedBox(height: 10),
+            ],
             TextField(
               controller: _deviceController,
               enabled: !_running,
-              decoration: InputDecoration(
-                labelText: '采集卡视频设备名 (dshow)',
-                suffixIcon: IconButton(
-                  onPressed: _running ? null : _scanDevices,
-                  icon: const Icon(Icons.search),
-                ),
+              decoration: const InputDecoration(
+                labelText: '采集卡视频设备名 (dshow，可手填)',
+                hintText: '如 video=LCC2003B',
               ),
             ),
             const SizedBox(height: 10),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('手动码区定位（优先）'),
+              value: _manualRegionEnabled,
+              onChanged: _running
+                  ? null
+                  : (bool value) {
+                      setState(() {
+                        _manualRegionEnabled = value;
+                      });
+                    },
+            ),
+            if (_manualRegionEnabled) ...<Widget>[
+              _buildTuningSlider(
+                label: '中心 X',
+                value: _manualCenterX,
+                onChanged: (double v) => setState(() => _manualCenterX = v),
+              ),
+              _buildTuningSlider(
+                label: '中心 Y',
+                value: _manualCenterY,
+                onChanged: (double v) => setState(() => _manualCenterY = v),
+              ),
+              _buildTuningSlider(
+                label: '宽度',
+                value: _manualWidthFraction,
+                min: 0.12,
+                max: 0.90,
+                onChanged: (double v) =>
+                    setState(() => _manualWidthFraction = v),
+              ),
+              const SizedBox(height: 8),
+            ],
             Row(
               children: <Widget>[
                 Expanded(
@@ -900,6 +984,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
             _kv('解码帧', '$_decodedFrames'),
             _kv('有效帧', '$_validFrames'),
             _kv('无效帧', '$_invalidFrames'),
+            _kv('已扫设备数', '${_videoDevices.length}'),
             _kv('最后包', _lastPacketInfo),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: progress == 0 ? null : progress),
@@ -914,7 +999,28 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     );
   }
 
-  Widget _buildReceiverStatus(double progress) {
+  Widget _buildTuningSlider({
+    required String label,
+    required double value,
+    required ValueChanged<double> onChanged,
+    double min = 0.05,
+    double max = 0.95,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('$label: ${value.toStringAsFixed(2)}'),
+        Slider(
+          value: value.clamp(min, max),
+          min: min,
+          max: max,
+          onChanged: onChanged,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildReceiverStatus(double progress, bool narrow) {
     final String captureTime = _latestCaptureAt == null
         ? '-'
         : _latestCaptureAt!
@@ -923,7 +1029,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
               .replaceFirst('T', ' ')
               .split('.')
               .first;
-    return Column(
+    final Widget content = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         Card(
@@ -938,63 +1044,65 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
                 ),
                 const SizedBox(height: 8),
                 _kv('最后截图时间', captureTime),
+                _kv(
+                  '截图尺寸',
+                  (_latestCaptureWidth == null || _latestCaptureHeight == null)
+                      ? '-'
+                      : '$_latestCaptureWidth x $_latestCaptureHeight',
+                ),
                 const SizedBox(height: 8),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: AspectRatio(
-                    aspectRatio: 16 / 9,
-                    child: DecoratedBox(
-                      decoration: const BoxDecoration(color: Color(0xFF0F172A)),
-                      child: _latestCaptureBytes == null
-                          ? const Center(
-                              child: Text(
-                                '尚未采集到截图',
-                                style: TextStyle(color: Colors.white70),
-                              ),
-                            )
-                          : Stack(
-                              fit: StackFit.expand,
-                              children: <Widget>[
-                                Image.memory(
-                                  _latestCaptureBytes!,
-                                  gaplessPlayback: true,
-                                  fit: BoxFit.contain,
-                                  filterQuality: FilterQuality.none,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(maxHeight: narrow ? 420 : 360),
+                    child: AspectRatio(
+                      aspectRatio: 16 / 9,
+                      child: DecoratedBox(
+                        decoration: const BoxDecoration(
+                          color: Color(0xFF0F172A),
+                        ),
+                        child: _latestCaptureBytes == null
+                            ? const Center(
+                                child: Text(
+                                  '尚未采集到截图',
+                                  style: TextStyle(color: Colors.white70),
                                 ),
-                                IgnorePointer(
-                                  child: CustomPaint(
-                                    painter: _SamplingOverlayPainter(),
+                              )
+                            : Stack(
+                                fit: StackFit.expand,
+                                children: <Widget>[
+                                  Image.memory(
+                                    _latestCaptureBytes!,
+                                    gaplessPlayback: true,
+                                    fit: BoxFit.contain,
+                                    filterQuality: FilterQuality.none,
                                   ),
-                                ),
-                              ],
-                            ),
+                                  IgnorePointer(
+                                    child: CustomPaint(
+                                      painter: _SamplingOverlayPainter(
+                                        normalizedRect: _manualRegionEnabled
+                                            ? _manualNormalizedRect()
+                                            : _lastDetectedNormalizedRect,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                      ),
                     ),
                   ),
                 ),
                 const SizedBox(height: 8),
-                const Text(
-                  '黄色框为解码采样区域。若此区域未完整覆盖发送端黑白码图，通常会导致无有效帧。',
-                  style: TextStyle(color: Color(0xFF475569), fontSize: 12.5),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const Text(
-                  '接收日志',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 10),
-                SelectableText(
-                  _ffmpegLog.isEmpty ? '暂无日志' : _ffmpegLog,
-                  style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+                Text(
+                  _manualRegionEnabled
+                      ? '手动模式已启用，黄色框为手动码区。无效帧持续增长时请微调中心与宽度。'
+                      : (_lastDetectedNormalizedRect == null
+                            ? '未识别到有效码区。请让发送端码图尽量充满采集画面，避免窗口边框与系统桌面占据主体。'
+                            : '黄色框为本帧实际命中的解码区域。'),
+                  style: const TextStyle(
+                    color: Color(0xFF475569),
+                    fontSize: 12.5,
+                  ),
                 ),
               ],
             ),
@@ -1029,6 +1137,10 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         ),
       ],
     );
+    if (narrow) {
+      return content;
+    }
+    return SingleChildScrollView(child: content);
   }
 }
 
@@ -1051,10 +1163,22 @@ String _defaultFfmpegPath() {
 }
 
 class _SamplingOverlayPainter extends CustomPainter {
+  const _SamplingOverlayPainter({required this.normalizedRect});
+
+  final Rect? normalizedRect;
+
   @override
   void paint(Canvas canvas, Size size) {
-    final VisualFrameGeometry g = VisualFrameGeometry.fromSize(size);
-    final Rect r = Rect.fromLTWH(g.left, g.top, g.width, g.height);
+    final Rect? n = normalizedRect;
+    if (n == null) {
+      return;
+    }
+    final Rect r = Rect.fromLTWH(
+      n.left * size.width,
+      n.top * size.height,
+      n.width * size.width,
+      n.height * size.height,
+    );
     final Paint border = Paint()
       ..color = const Color(0xFFFBBF24)
       ..style = PaintingStyle.stroke
@@ -1063,7 +1187,9 @@ class _SamplingOverlayPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _SamplingOverlayPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _SamplingOverlayPainter oldDelegate) {
+    return oldDelegate.normalizedRect != normalizedRect;
+  }
 }
 
 Widget _kv(String key, String value) {
@@ -1125,19 +1251,16 @@ class _DshowScanResult {
   const _DshowScanResult({
     required this.videoDevices,
     required this.audioDevices,
-    required this.rawOutput,
   });
 
   final List<_DshowDeviceEntry> videoDevices;
   final List<_DshowDeviceEntry> audioDevices;
-  final String rawOutput;
 }
 
 _DshowScanResult _parseDshowScanResult(String text) {
   return _DshowScanResult(
     videoDevices: _parseDshowSectionEntries(text, 'DirectShow video devices'),
     audioDevices: _parseDshowSectionEntries(text, 'DirectShow audio devices'),
-    rawOutput: text,
   );
 }
 
@@ -1198,7 +1321,7 @@ _DshowDeviceEntry? _guessBestCaptureVideoDevice(
       best = video;
     }
   }
-  if (best == null || bestScore < 4) {
+  if (best == null || bestScore < 7) {
     return null;
   }
   return best;
@@ -1231,11 +1354,17 @@ int _scoreCaptureDevice(
       score += 5;
     }
   }
+  if (RegExp(r'^[a-z]{2,}[0-9]{2,}[a-z0-9]*$').hasMatch(name)) {
+    score += 4;
+  }
   if (name.contains('camera')) {
     score += 1;
   }
   if (alt.contains('usb#vid_')) {
     score += 3;
+  }
+  if (name == 'hd camera') {
+    score -= 2;
   }
 
   const List<String> negativeKeywords = <String>[
@@ -1267,7 +1396,7 @@ int _scoreCaptureDevice(
       score += 6;
     }
     if (modelToken != null && audioName.contains(modelToken)) {
-      score += 8;
+      score += 14;
     }
   }
   return score;
