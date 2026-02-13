@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 
 import 'visual_protocol.dart';
 
+enum SenderVisualStyle { reliableMono, reliableMonoSoft }
+
 class VisualFrameGeometry {
   const VisualFrameGeometry({
     required this.left,
@@ -96,26 +98,33 @@ class VisualFrameGeometry {
 }
 
 class VisualFramePainter extends CustomPainter {
-  VisualFramePainter({required this.frameBytes, required this.subtitle})
-    : _bits = VisualFrameBitCodec.bytesToBits(frameBytes);
+  VisualFramePainter({
+    required this.frameBytes,
+    required this.subtitle,
+    this.style = SenderVisualStyle.reliableMonoSoft,
+  }) : _bits = VisualFrameBitCodec.bytesToBits(frameBytes);
 
   final Uint8List frameBytes;
   final String subtitle;
+  final SenderVisualStyle style;
   final List<int> _bits;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final List<Color> colors = style == SenderVisualStyle.reliableMono
+        ? const <Color>[Color(0xFF101213), Color(0xFF08090A)]
+        : const <Color>[Color(0xFF0F172A), Color(0xFF0B1222)];
     final Paint bg = Paint()
-      ..shader = const LinearGradient(
+      ..shader = LinearGradient(
         begin: Alignment.topLeft,
         end: Alignment.bottomRight,
-        colors: <Color>[Color(0xFF111215), Color(0xFF060708)],
+        colors: colors,
       ).createShader(Offset.zero & size);
     canvas.drawRect(Offset.zero & size, bg);
 
     final VisualFrameGeometry g = VisualFrameGeometry.fromSize(size);
     final Rect region = Rect.fromLTWH(g.left, g.top, g.width, g.height);
-    final Paint white = Paint()..color = const Color(0xFFF4F5F6);
+    final Paint white = Paint()..color = const Color(0xFFF7F8FA);
     final Paint black = Paint()..color = const Color(0xFF060606);
     final Paint border = Paint()
       ..color = const Color(0xFFECEFF1)
@@ -189,72 +198,107 @@ class DecodedFrameCandidate {
 }
 
 class VisualFrameSampler {
+  static Future<DecodedFrameCandidate?> decodeWithHint(
+    Uint8List encodedImageBytes, {
+    Rect? normalizedHint,
+    bool allowGlobalSearch = true,
+  }) async {
+    final _DecodedImage? decodedImage = await _decodeImageToRaw(
+      encodedImageBytes,
+    );
+    if (decodedImage == null) {
+      return null;
+    }
+    final ByteData raw = decodedImage.rawRgba;
+    final int width = decodedImage.width;
+    final int height = decodedImage.height;
+    if (normalizedHint != null) {
+      final DecodedFrameCandidate? local = _decodeAroundNormalizedHint(
+        rawRgba: raw,
+        width: width,
+        height: height,
+        normalizedHint: normalizedHint,
+      );
+      if (local != null) {
+        return local;
+      }
+    }
+    if (!allowGlobalSearch) {
+      return null;
+    }
+    return _decodeFromRaw(rawRgba: raw, width: width, height: height);
+  }
+
   static Future<DecodedFrameCandidate?> decodeAtHint(
     Uint8List encodedImageBytes, {
     required double centerXFraction,
     required double centerYFraction,
     required double widthFraction,
   }) async {
-    try {
-      final ui.Codec codec = await ui.instantiateImageCodec(encodedImageBytes);
-      final ui.FrameInfo frame = await codec.getNextFrame();
-      final ui.Image image = frame.image;
-      final ByteData? raw = await image.toByteData(
-        format: ui.ImageByteFormat.rawRgba,
-      );
-      if (raw == null) {
-        return null;
-      }
-      final Size size = Size(image.width.toDouble(), image.height.toDouble());
-      final VisualFrameGeometry geometry =
-          VisualFrameGeometry.fromCenterAndWidthFraction(
-            size: size,
-            centerXFraction: centerXFraction,
-            centerYFraction: centerYFraction,
-            widthFraction: widthFraction,
-          );
-      return _tryDecodeGeometry(
-        rawRgba: raw,
-        width: image.width,
-        height: image.height,
-        geometry: geometry,
-      );
-    } catch (_) {
+    final _DecodedImage? decodedImage = await _decodeImageToRaw(
+      encodedImageBytes,
+    );
+    if (decodedImage == null) {
       return null;
     }
+    final Size size = Size(
+      decodedImage.width.toDouble(),
+      decodedImage.height.toDouble(),
+    );
+    final VisualFrameGeometry geometry =
+        VisualFrameGeometry.fromCenterAndWidthFraction(
+          size: size,
+          centerXFraction: centerXFraction,
+          centerYFraction: centerYFraction,
+          widthFraction: widthFraction,
+        );
+    return _tryDecodeGeometry(
+      rawRgba: decodedImage.rawRgba,
+      width: decodedImage.width,
+      height: decodedImage.height,
+      geometry: geometry,
+    );
   }
 
   static Future<DecodedFrameCandidate?> decodeAtNormalizedRect(
     Uint8List encodedImageBytes,
     Rect normalizedRect,
   ) async {
-    try {
-      final ui.Codec codec = await ui.instantiateImageCodec(encodedImageBytes);
-      final ui.FrameInfo frame = await codec.getNextFrame();
-      final ui.Image image = frame.image;
-      final ByteData? raw = await image.toByteData(
-        format: ui.ImageByteFormat.rawRgba,
-      );
-      if (raw == null) {
-        return null;
-      }
-      final Size size = Size(image.width.toDouble(), image.height.toDouble());
-      final VisualFrameGeometry geometry = _geometryFromNormalizedRect(
-        size,
-        normalizedRect,
-      );
-      return _tryDecodeGeometry(
-        rawRgba: raw,
-        width: image.width,
-        height: image.height,
-        geometry: geometry,
-      );
-    } catch (_) {
+    final _DecodedImage? decodedImage = await _decodeImageToRaw(
+      encodedImageBytes,
+    );
+    if (decodedImage == null) {
       return null;
     }
+    final VisualFrameGeometry geometry = _geometryFromNormalizedRect(
+      Size(decodedImage.width.toDouble(), decodedImage.height.toDouble()),
+      normalizedRect,
+    );
+    return _tryDecodeGeometry(
+      rawRgba: decodedImage.rawRgba,
+      width: decodedImage.width,
+      height: decodedImage.height,
+      geometry: geometry,
+    );
   }
 
   static Future<DecodedFrameCandidate?> decodeBestFrame(
+    Uint8List encodedImageBytes,
+  ) async {
+    final _DecodedImage? decodedImage = await _decodeImageToRaw(
+      encodedImageBytes,
+    );
+    if (decodedImage == null) {
+      return null;
+    }
+    return _decodeFromRaw(
+      rawRgba: decodedImage.rawRgba,
+      width: decodedImage.width,
+      height: decodedImage.height,
+    );
+  }
+
+  static Future<_DecodedImage?> _decodeImageToRaw(
     Uint8List encodedImageBytes,
   ) async {
     try {
@@ -267,14 +311,47 @@ class VisualFrameSampler {
       if (raw == null) {
         return null;
       }
-      return _decodeFromRaw(
-        rawRgba: raw,
+      return _DecodedImage(
         width: image.width,
         height: image.height,
+        rawRgba: raw,
       );
     } catch (_) {
       return null;
     }
+  }
+
+  static DecodedFrameCandidate? _decodeAroundNormalizedHint({
+    required ByteData rawRgba,
+    required int width,
+    required int height,
+    required Rect normalizedHint,
+  }) {
+    final Size size = Size(width.toDouble(), height.toDouble());
+    final VisualFrameGeometry base = _geometryFromNormalizedRect(
+      size,
+      normalizedHint,
+    );
+    final List<VisualFrameGeometry> candidates = <VisualFrameGeometry>[];
+    for (final double scale in <double>[1.00, 0.96, 1.04, 0.90, 1.10]) {
+      for (final double dx in <double>[-0.03, 0.0, 0.03]) {
+        for (final double dy in <double>[-0.03, 0.0, 0.03]) {
+          candidates.add(_scaledShiftedGeometry(base, size, scale, dx, dy));
+        }
+      }
+    }
+    for (final VisualFrameGeometry geometry in candidates) {
+      final DecodedFrameCandidate? decoded = _tryDecodeGeometry(
+        rawRgba: rawRgba,
+        width: width,
+        height: height,
+        geometry: geometry,
+      );
+      if (decoded != null) {
+        return decoded;
+      }
+    }
+    return null;
   }
 
   static DecodedFrameCandidate? _decodeFromRaw({
@@ -586,4 +663,16 @@ class _GeometryScore {
 
   final VisualFrameGeometry geometry;
   final double score;
+}
+
+class _DecodedImage {
+  const _DecodedImage({
+    required this.width,
+    required this.height,
+    required this.rawRgba,
+  });
+
+  final int width;
+  final int height;
+  final ByteData rawRgba;
 }

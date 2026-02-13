@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart';
 
 import 'src/visual_frame_codec.dart';
+import 'src/mjpeg_parser.dart';
 import 'src/visual_protocol.dart';
 
 void main() {
@@ -204,8 +205,7 @@ class _SenderPanelState extends State<SenderPanel> {
     final VisualPacket packet =
         session.schedule[_scheduleIndex % session.schedule.length];
     _currentFrame = packet.toFrameBytes();
-    _subtitle =
-        'TID ${packet.transferId.toRadixString(16)} | ${packet.isParity ? 'Parity' : 'Data'} #${packet.chunkIndex} | Group ${packet.groupIndex}';
+    _subtitle = '';
     _scheduleIndex++;
     _sentFrames++;
     setState(() {});
@@ -450,11 +450,18 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   final TextEditingController _outputDirController = TextEditingController();
 
   Process? _captureProcess;
-  Timer? _pollTimer;
-  File? _captureFile;
-  DateTime? _lastFrameTs;
+  StreamSubscription<List<int>>? _captureStdoutSub;
+  StreamSubscription<List<int>>? _captureStderrSub;
+  late final MjpegFrameParser _mjpegParser;
+  Uint8List? _pendingFrame;
   bool _decodingBusy = false;
   bool _running = false;
+  int _consecutiveMisses = 0;
+  final int _globalRescanThreshold = 8;
+  DateTime? _startedAt;
+  int _inputFrames = 0;
+  int _droppedFrames = 0;
+  final List<int> _decodeCostsMs = <int>[];
 
   TransferAssembler? _assembler;
   int? _activeTransferId;
@@ -486,6 +493,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   void initState() {
     super.initState();
     _ffmpegController = TextEditingController(text: _defaultFfmpegPath());
+    _mjpegParser = MjpegFrameParser(onFrame: _onMjpegFrame);
     _outputDirController.text = Directory.current.path;
     Future<void>.delayed(
       const Duration(milliseconds: 220),
@@ -747,12 +755,9 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
 
     _resetTransferState();
     await _startRuntimeLogSession();
-    final Directory temp = Directory.systemTemp;
-    final File captureFile = File(
-      '${temp.path}${Platform.pathSeparator}capture_vision_latest.jpg',
-    );
-    _captureFile = captureFile;
-    _lastFrameTs = null;
+    _pendingFrame = null;
+    _mjpegParser.reset();
+    _startedAt = DateTime.now();
 
     try {
       _captureProcess = await Process.start(ffmpegPath, <String>[
@@ -769,25 +774,45 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         'video=$device',
         '-vf',
         'fps=$decodeFps',
+        '-an',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'mjpeg',
         '-q:v',
         '3',
-        '-update',
-        '1',
-        '-y',
-        captureFile.path,
+        '-',
       ], runInShell: true);
 
-      _captureProcess!.stderr.listen((List<int> _) {});
-      _captureProcess!.stdout.listen((List<int> _) {});
+      _captureStderrSub = _captureProcess!.stderr.listen((List<int> chunk) {
+        final String text = _decodeProcessBytesAuto(chunk).trim();
+        if (text.isNotEmpty) {
+          _appendRuntimeLog('ffmpeg: $text');
+        }
+      });
+      _captureStdoutSub = _captureProcess!.stdout.listen(
+        (List<int> chunk) => _mjpegParser.addChunk(chunk),
+        onDone: () => _appendRuntimeLog('ffmpeg stdout closed'),
+      );
+      unawaited(
+        _captureProcess!.exitCode.then((int code) {
+          _appendRuntimeLog('ffmpeg exited: $code');
+          if (!_running) {
+            return;
+          }
+          if (mounted) {
+            setState(() {
+              _running = false;
+              _status = '采集中断：ffmpeg 已退出 ($code)';
+            });
+          }
+        }),
+      );
 
       _running = true;
       _status = '接收中，等待有效帧...';
       await _appendRuntimeLog(
-        'receiver started: ffmpeg=$ffmpegPath, device=$device, capture=$captureSize@$captureFps, decodeFps=$decodeFps',
-      );
-      _pollTimer = Timer.periodic(
-        Duration(milliseconds: (1000 / decodeFps).round()),
-        (_) => _pollFrame(),
+        'receiver started(pipe): ffmpeg=$ffmpegPath, device=$device, capture=$captureSize@$captureFps, decodeFps=$decodeFps',
       );
       setState(() {});
     } catch (e) {
@@ -798,24 +823,28 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     }
   }
 
-  Future<void> _pollFrame() async {
-    if (_decodingBusy || !_running) {
+  void _onMjpegFrame(Uint8List frameBytes) {
+    if (!_running) {
       return;
     }
-    final File? frameFile = _captureFile;
-    if (frameFile == null || !await frameFile.exists()) {
+    _inputFrames++;
+    _latestCaptureBytes = frameBytes;
+    _latestCaptureAt = DateTime.now();
+    if (_decodingBusy) {
+      _pendingFrame = frameBytes;
+      _droppedFrames++;
       return;
     }
-    final DateTime modifiedAt = await frameFile.lastModified();
-    if (_lastFrameTs != null && !modifiedAt.isAfter(_lastFrameTs!)) {
+    unawaited(_decodeFrame(frameBytes));
+  }
+
+  Future<void> _decodeFrame(Uint8List bytes) async {
+    if (!_running) {
       return;
     }
-    _lastFrameTs = modifiedAt;
     _decodingBusy = true;
+    final Stopwatch sw = Stopwatch()..start();
     try {
-      final Uint8List bytes = await frameFile.readAsBytes();
-      _latestCaptureBytes = bytes;
-      _latestCaptureAt = modifiedAt;
       _decodedFrames++;
       DecodedFrameCandidate? decodedCandidate;
       if (_manualRegionEnabled) {
@@ -825,13 +854,25 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
           centerYFraction: _manualCenterY,
           widthFraction: _manualWidthFraction,
         );
+      } else {
+        final Rect? hint = _lastDetectedNormalizedRect;
+        if (hint != null) {
+          final bool allowGlobal = _consecutiveMisses >= _globalRescanThreshold;
+          decodedCandidate = await VisualFrameSampler.decodeWithHint(
+            bytes,
+            normalizedHint: hint,
+            allowGlobalSearch: allowGlobal,
+          );
+        } else {
+          decodedCandidate = await VisualFrameSampler.decodeBestFrame(bytes);
+        }
       }
-      decodedCandidate ??= await VisualFrameSampler.decodeBestFrame(bytes);
       if (decodedCandidate == null) {
         _invalidFrames++;
+        _consecutiveMisses++;
         _lastDetectedNormalizedRect = _manualRegionEnabled
             ? _manualNormalizedRect()
-            : null;
+            : _lastDetectedNormalizedRect;
         await _persistRuntimeFrame(
           bytes: bytes,
           valid: false,
@@ -839,6 +880,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         );
         return;
       }
+      _consecutiveMisses = 0;
       _latestCaptureWidth = decodedCandidate.sourceWidth;
       _latestCaptureHeight = decodedCandidate.sourceHeight;
       _lastDetectedNormalizedRect = decodedCandidate.geometry.toNormalizedRect(
@@ -855,11 +897,71 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       );
       _handlePacket(decodedCandidate.decoded.packet);
     } finally {
+      sw.stop();
+      _recordDecodeCost(sw.elapsedMilliseconds);
       _decodingBusy = false;
+      final Uint8List? pending = _pendingFrame;
+      _pendingFrame = null;
+      if (pending != null && _running) {
+        unawaited(_decodeFrame(pending));
+      }
       if (mounted) {
         setState(() {});
       }
     }
+  }
+
+  void _recordDecodeCost(int ms) {
+    _decodeCostsMs.add(ms);
+    const int maxSamples = 160;
+    if (_decodeCostsMs.length > maxSamples) {
+      _decodeCostsMs.removeRange(0, _decodeCostsMs.length - maxSamples);
+    }
+  }
+
+  double _elapsedSeconds() {
+    final DateTime? started = _startedAt;
+    if (started == null) {
+      return 0;
+    }
+    final int elapsedMs = DateTime.now().difference(started).inMilliseconds;
+    if (elapsedMs <= 0) {
+      return 0;
+    }
+    return elapsedMs / 1000.0;
+  }
+
+  String _ratePerSec(int count) {
+    final double sec = _elapsedSeconds();
+    if (sec <= 0) {
+      return '-';
+    }
+    return (count / sec).toStringAsFixed(2);
+  }
+
+  String _dropRatePercent() {
+    if (_inputFrames <= 0) {
+      return '-';
+    }
+    final double rate = (_droppedFrames * 100.0) / _inputFrames;
+    return '${rate.toStringAsFixed(1)}%';
+  }
+
+  String _avgDecodeMs() {
+    if (_decodeCostsMs.isEmpty) {
+      return '-';
+    }
+    final int sum = _decodeCostsMs.fold<int>(0, (int p, int v) => p + v);
+    return (sum / _decodeCostsMs.length).toStringAsFixed(1);
+  }
+
+  String _p95DecodeMs() {
+    if (_decodeCostsMs.isEmpty) {
+      return '-';
+    }
+    final List<int> sorted = List<int>.from(_decodeCostsMs)..sort();
+    final int index = ((sorted.length - 1) * 0.95).round();
+    return sorted[index].toString();
   }
 
   Future<void> _handlePacket(VisualPacket packet) async {
@@ -919,10 +1021,15 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   }
 
   void _stopReceiver() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
+    _captureStdoutSub?.cancel();
+    _captureStdoutSub = null;
+    _captureStderrSub?.cancel();
+    _captureStderrSub = null;
     _captureProcess?.kill(ProcessSignal.sigterm);
     _captureProcess = null;
+    _pendingFrame = null;
+    _decodingBusy = false;
+    _mjpegParser.reset();
     _appendRuntimeLog('receiver stopped');
     if (_running) {
       setState(() {
@@ -947,6 +1054,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _latestCaptureHeight = null;
     _lastDetectedNormalizedRect = null;
     _runtimeFrameIndex = 0;
+    _consecutiveMisses = 0;
+    _inputFrames = 0;
+    _droppedFrames = 0;
+    _decodeCostsMs.clear();
+    _startedAt = null;
   }
 
   @override
@@ -1135,6 +1247,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
             ),
             const SizedBox(height: 12),
             _kv('状态', _status),
+            _kv('采集链路', 'ffmpeg image2pipe (mjpeg)'),
             _kv(
               '传输 ID',
               _activeTransferId == null
@@ -1142,9 +1255,14 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
                   : _activeTransferId!.toRadixString(16),
             ),
             _kv('数据分片', _totalDataChunks == 0 ? '-' : '$_totalDataChunks'),
+            _kv('输入帧', '$_inputFrames (${_ratePerSec(_inputFrames)} fps)'),
             _kv('解码帧', '$_decodedFrames'),
+            _kv('解码速率', '${_ratePerSec(_decodedFrames)} fps'),
             _kv('有效帧', '$_validFrames'),
+            _kv('有效速率', '${_ratePerSec(_validFrames)} fps'),
             _kv('无效帧', '$_invalidFrames'),
+            _kv('队列丢帧率', _dropRatePercent()),
+            _kv('解码耗时', '${_avgDecodeMs()} ms (P95 ${_p95DecodeMs()} ms)'),
             _kv('已扫设备数', '${_videoDevices.length}'),
             _kv('日志目录', _runtimeLogDirPath),
             _kv('最后包', _lastPacketInfo),
