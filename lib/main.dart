@@ -424,17 +424,22 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   String _status = '空闲';
   String _lastPacketInfo = '-';
   String _savedFilePath = '';
+  String _runtimeLogDirPath = '-';
   Uint8List? _latestCaptureBytes;
   DateTime? _latestCaptureAt;
   int? _latestCaptureWidth;
   int? _latestCaptureHeight;
   Rect? _lastDetectedNormalizedRect;
   final List<_DshowDeviceEntry> _videoDevices = <_DshowDeviceEntry>[];
+  String? _selectedVideoDeviceName;
   bool _scanningDevices = false;
   bool _manualRegionEnabled = false;
   double _manualCenterX = 0.5;
   double _manualCenterY = 0.5;
   double _manualWidthFraction = 0.40;
+  Directory? _runtimeSessionDir;
+  File? _runtimeIndexFile;
+  int _runtimeFrameIndex = 0;
 
   @override
   void initState() {
@@ -457,19 +462,6 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _decodeFpsController.dispose();
     _outputDirController.dispose();
     super.dispose();
-  }
-
-  String? get _selectedDropdownDevice {
-    final String current = _deviceController.text.trim();
-    if (current.isEmpty) {
-      return null;
-    }
-    for (final _DshowDeviceEntry d in _videoDevices) {
-      if (d.name == current) {
-        return current;
-      }
-    }
-    return null;
   }
 
   Future<void> _scanDevices({bool silent = false}) async {
@@ -502,22 +494,36 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
           ..clear()
           ..addAll(scanResult.videoDevices);
         if (scanResult.videoDevices.isEmpty) {
+          _selectedVideoDeviceName = null;
           _deviceController.clear();
           if (!silent) {
             _status = '未解析到采集设备，请确认系统识别到了采集卡。';
           }
         } else if (guessed != null) {
+          _selectedVideoDeviceName = guessed.name;
           _deviceController.text = guessed.name;
           _status =
               '扫描到 ${scanResult.videoDevices.length} 个视频设备，已自动选择：${guessed.name}';
         } else {
-          _deviceController.clear();
+          final String current = _selectedVideoDeviceName ?? '';
+          final bool stillExists = scanResult.videoDevices.any(
+            (_DshowDeviceEntry e) => e.name == current,
+          );
+          _selectedVideoDeviceName = stillExists ? current : null;
+          if (_selectedVideoDeviceName == null) {
+            _deviceController.clear();
+          } else {
+            _deviceController.text = _selectedVideoDeviceName!;
+          }
           if (!silent) {
             _status =
                 '扫描到 ${scanResult.videoDevices.length} 个视频设备，但未识别出采集卡，请手动填写。';
           }
         }
       });
+      await _appendRuntimeLog(
+        'scan devices: ${scanResult.videoDevices.length} video, ${scanResult.audioDevices.length} audio; selected=${_selectedVideoDeviceName ?? 'none'}',
+      );
     } catch (e) {
       setState(() {
         if (!silent) {
@@ -565,9 +571,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       return;
     }
     setState(() {
+      _selectedVideoDeviceName = value;
       _deviceController.text = value;
       _status = '已选择设备：$value';
     });
+    _appendRuntimeLog('manual select device: $value');
   }
 
   Rect _manualNormalizedRect() {
@@ -587,12 +595,95 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     return Rect.fromLTWH(left, top, w, h);
   }
 
+  Future<void> _startRuntimeLogSession() async {
+    final String ts = DateTime.now()
+        .toIso8601String()
+        .replaceAll(':', '-')
+        .replaceAll('.', '-');
+    final Directory root = Directory(
+      '${Directory.current.path}${Platform.pathSeparator}runtime_logs',
+    );
+    if (!await root.exists()) {
+      await root.create(recursive: true);
+    }
+    final Directory session = Directory(
+      '${root.path}${Platform.pathSeparator}session_$ts',
+    );
+    if (!await session.exists()) {
+      await session.create(recursive: true);
+    }
+    final File index = File(
+      '${session.path}${Platform.pathSeparator}index.log',
+    );
+    await index.writeAsString(
+      'session start: ${DateTime.now().toIso8601String()}\n',
+      mode: FileMode.write,
+      flush: true,
+    );
+    _runtimeSessionDir = session;
+    _runtimeIndexFile = index;
+    _runtimeFrameIndex = 0;
+    _runtimeLogDirPath = session.path;
+  }
+
+  Future<void> _appendRuntimeLog(String text) async {
+    final File? index = _runtimeIndexFile;
+    if (index == null) {
+      return;
+    }
+    final String line = '${DateTime.now().toIso8601String()} | $text\n';
+    try {
+      await index.writeAsString(line, mode: FileMode.append, flush: true);
+    } catch (_) {
+      // ignore logging failures
+    }
+  }
+
+  bool _shouldPersistFrame(int index) {
+    if (index <= 300) {
+      return true;
+    }
+    return index % 10 == 0;
+  }
+
+  Future<void> _persistRuntimeFrame({
+    required Uint8List bytes,
+    required bool valid,
+    Rect? normalizedRect,
+  }) async {
+    final Directory? dir = _runtimeSessionDir;
+    if (dir == null) {
+      return;
+    }
+    _runtimeFrameIndex++;
+    if (!_shouldPersistFrame(_runtimeFrameIndex)) {
+      return;
+    }
+    final String flag = valid ? 'valid' : 'invalid';
+    final String fileName =
+        '${_runtimeFrameIndex.toString().padLeft(6, '0')}_$flag.jpg';
+    final File out = File('${dir.path}${Platform.pathSeparator}$fileName');
+    try {
+      await out.writeAsBytes(bytes, flush: false);
+      final String rectText = normalizedRect == null
+          ? 'none'
+          : '${normalizedRect.left.toStringAsFixed(4)},${normalizedRect.top.toStringAsFixed(4)},${normalizedRect.width.toStringAsFixed(4)},${normalizedRect.height.toStringAsFixed(4)}';
+      await _appendRuntimeLog(
+        'frame=$_runtimeFrameIndex $flag saved=$fileName rect=$rectText',
+      );
+    } catch (_) {
+      // ignore logging failures
+    }
+  }
+
   Future<void> _startReceiver() async {
     if (_running) {
       return;
     }
     final String ffmpegPath = _ffmpegController.text.trim();
-    final String device = _deviceController.text.trim();
+    final String device = _deviceController.text.trim().isNotEmpty
+        ? _deviceController.text.trim()
+        : (_selectedVideoDeviceName ?? '');
     final String captureSize = _captureSizeController.text.trim();
     final int captureFps =
         int.tryParse(_captureFpsController.text.trim()) ?? 30;
@@ -612,6 +703,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     }
 
     _resetTransferState();
+    await _startRuntimeLogSession();
     final Directory temp = Directory.systemTemp;
     final File captureFile = File(
       '${temp.path}${Platform.pathSeparator}capture_vision_latest.jpg',
@@ -647,12 +739,16 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
 
       _running = true;
       _status = '接收中，等待有效帧...';
+      await _appendRuntimeLog(
+        'receiver started: ffmpeg=$ffmpegPath, device=$device, capture=$captureSize@$captureFps, decodeFps=$decodeFps',
+      );
       _pollTimer = Timer.periodic(
         Duration(milliseconds: (1000 / decodeFps).round()),
         (_) => _pollFrame(),
       );
       setState(() {});
     } catch (e) {
+      await _appendRuntimeLog('start receiver failed: $e');
       setState(() {
         _status = '启动 ffmpeg 失败: $e';
       });
@@ -693,6 +789,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         _lastDetectedNormalizedRect = _manualRegionEnabled
             ? _manualNormalizedRect()
             : null;
+        await _persistRuntimeFrame(
+          bytes: bytes,
+          valid: false,
+          normalizedRect: _lastDetectedNormalizedRect,
+        );
         return;
       }
       _latestCaptureWidth = decodedCandidate.sourceWidth;
@@ -704,6 +805,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         ),
       );
       _validFrames++;
+      await _persistRuntimeFrame(
+        bytes: bytes,
+        valid: true,
+        normalizedRect: _lastDetectedNormalizedRect,
+      );
       _handlePacket(decodedCandidate.decoded.packet);
     } finally {
       _decodingBusy = false;
@@ -774,6 +880,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _pollTimer = null;
     _captureProcess?.kill(ProcessSignal.sigterm);
     _captureProcess = null;
+    _appendRuntimeLog('receiver stopped');
     if (_running) {
       setState(() {
         _running = false;
@@ -796,6 +903,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _latestCaptureWidth = null;
     _latestCaptureHeight = null;
     _lastDetectedNormalizedRect = null;
+    _runtimeFrameIndex = 0;
   }
 
   @override
@@ -828,6 +936,12 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
 
   Widget _buildReceiverControls(double progress) {
     final bool hasDevices = _videoDevices.isNotEmpty;
+    final String? selected =
+        hasDevices &&
+            _selectedVideoDeviceName != null &&
+            _videoDevices.any((e) => e.name == _selectedVideoDeviceName)
+        ? _selectedVideoDeviceName
+        : null;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -857,23 +971,27 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
               ],
             ),
             const SizedBox(height: 10),
-            if (hasDevices) ...<Widget>[
-              DropdownButtonFormField<String>(
-                initialValue: _selectedDropdownDevice,
-                isExpanded: true,
-                decoration: const InputDecoration(labelText: '扫描结果（视频设备）'),
-                items: _videoDevices
-                    .map(
-                      (_DshowDeviceEntry d) => DropdownMenuItem<String>(
-                        value: d.name,
-                        child: Text(d.name, overflow: TextOverflow.ellipsis),
-                      ),
-                    )
-                    .toList(),
-                onChanged: _running ? null : _selectDeviceFromDropdown,
+            DropdownButtonFormField<String>(
+              key: ValueKey<String>(
+                'devices_${_videoDevices.length}_$selected',
               ),
-              const SizedBox(height: 10),
-            ],
+              initialValue: selected,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: '可用视频设备'),
+              items: _videoDevices
+                  .map(
+                    (_DshowDeviceEntry d) => DropdownMenuItem<String>(
+                      value: d.name,
+                      child: Text(d.name, overflow: TextOverflow.ellipsis),
+                    ),
+                  )
+                  .toList(),
+              hint: Text(hasDevices ? '请选择视频设备' : '请先扫描设备'),
+              onChanged: (!_running && hasDevices)
+                  ? _selectDeviceFromDropdown
+                  : null,
+            ),
+            const SizedBox(height: 10),
             TextField(
               controller: _deviceController,
               enabled: !_running,
@@ -985,6 +1103,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
             _kv('有效帧', '$_validFrames'),
             _kv('无效帧', '$_invalidFrames'),
             _kv('已扫设备数', '${_videoDevices.length}'),
+            _kv('日志目录', _runtimeLogDirPath),
             _kv('最后包', _lastPacketInfo),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: progress == 0 ? null : progress),
@@ -1269,6 +1388,8 @@ List<_DshowDeviceEntry> _parseDshowSectionEntries(String text, String marker) {
   bool inSection = false;
   int? pendingIndex;
   final RegExp quoted = RegExp(r'"([^"]+)"');
+  final bool expectVideo = marker.toLowerCase().contains('video');
+  final bool expectAudio = marker.toLowerCase().contains('audio');
 
   for (final String line in text.split('\n')) {
     if (line.contains(marker)) {
@@ -1297,6 +1418,12 @@ List<_DshowDeviceEntry> _parseDshowSectionEntries(String text, String marker) {
           alternativeName: value,
         );
       }
+      continue;
+    }
+    if (expectVideo && !line.toLowerCase().contains('(video)')) {
+      continue;
+    }
+    if (expectAudio && !line.toLowerCase().contains('(audio)')) {
       continue;
     }
     devices.add(_DshowDeviceEntry(name: value));
