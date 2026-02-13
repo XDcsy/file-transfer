@@ -37,8 +37,8 @@ class VisualFrameGeometry {
   }
 
   static VisualFrameGeometry fromSize(Size size) {
-    const double horizontalUsage = 0.90;
-    const double verticalUsage = 0.80;
+    const double horizontalUsage = 0.97;
+    const double verticalUsage = 0.94;
     final double maxW = size.width * horizontalUsage;
     final double maxH = size.height * verticalUsage;
     final double targetAspect =
@@ -120,9 +120,10 @@ class VisualFramePainter extends CustomPainter {
     final Paint border = Paint()
       ..color = const Color(0xFFECEFF1)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
-    canvas.drawRect(region.inflate(12), white);
-    canvas.drawRect(region.inflate(12), border);
+      ..strokeWidth = 1.2
+      ..isAntiAlias = false;
+    canvas.drawRect(region, white);
+    canvas.drawRect(region, border);
 
     int bitIndex = 0;
     for (int r = 0; r < VisualProtocol.gridRows; r++) {
@@ -131,21 +132,24 @@ class VisualFramePainter extends CustomPainter {
         final Rect cell = Rect.fromLTWH(
           g.left + c * g.cellWidth,
           g.top + r * g.cellHeight,
-          g.cellWidth + 0.4,
-          g.cellHeight + 0.4,
+          g.cellWidth,
+          g.cellHeight,
         );
         canvas.drawRect(cell, isOne ? black : white);
       }
     }
 
+    if (subtitle.isEmpty) {
+      return;
+    }
     final TextPainter tp = TextPainter(
       textDirection: TextDirection.ltr,
       text: TextSpan(
         text: subtitle,
         style: const TextStyle(
-          color: Color(0xFFECEFF1),
-          fontSize: 15,
-          letterSpacing: 0.2,
+          color: Color(0xFFCBD5E1),
+          fontSize: 12,
+          letterSpacing: 0.1,
           fontWeight: FontWeight.w600,
         ),
       ),
@@ -350,24 +354,34 @@ class VisualFrameSampler {
     required int height,
     required VisualFrameGeometry geometry,
   }) {
-    final List<double> samples = _sampleFromRawWithGeometry(
-      rawRgba: rawRgba,
-      width: width,
-      height: height,
-      geometry: geometry,
-    );
-    final DecodedVisualFrame? decoded = VisualFrameDecoder.decodeLumaSamples(
-      samples,
-    );
-    if (decoded == null) {
-      return null;
+    final List<List<double>> sampleSets = <List<double>>[
+      _sampleFromRawWithGeometry(
+        rawRgba: rawRgba,
+        width: width,
+        height: height,
+        geometry: geometry,
+      ),
+      _sampleFromRawWithNestedGeometry(
+        rawRgba: rawRgba,
+        width: width,
+        height: height,
+        outer: geometry,
+      ),
+    ];
+    for (final List<double> samples in sampleSets) {
+      final DecodedVisualFrame? decoded = VisualFrameDecoder.decodeLumaSamples(
+        samples,
+      );
+      if (decoded != null) {
+        return DecodedFrameCandidate(
+          decoded: decoded,
+          geometry: geometry,
+          sourceWidth: width,
+          sourceHeight: height,
+        );
+      }
     }
-    return DecodedFrameCandidate(
-      decoded: decoded,
-      geometry: geometry,
-      sourceWidth: width,
-      sourceHeight: height,
-    );
+    return null;
   }
 
   static VisualFrameGeometry _geometryFromNormalizedRect(
@@ -539,6 +553,31 @@ class VisualFrameSampler {
       }
     }
     return samples;
+  }
+
+  static List<double> _sampleFromRawWithNestedGeometry({
+    required ByteData rawRgba,
+    required int width,
+    required int height,
+    required VisualFrameGeometry outer,
+  }) {
+    final VisualFrameGeometry inner = VisualFrameGeometry.fromSize(
+      Size(outer.width, outer.height),
+    );
+    final VisualFrameGeometry mapped = VisualFrameGeometry(
+      left: outer.left + inner.left,
+      top: outer.top + inner.top,
+      width: inner.width,
+      height: inner.height,
+      cellWidth: inner.width / VisualProtocol.gridCols,
+      cellHeight: inner.height / VisualProtocol.gridRows,
+    );
+    return _sampleFromRawWithGeometry(
+      rawRgba: rawRgba,
+      width: width,
+      height: height,
+      geometry: mapped,
+    );
   }
 }
 

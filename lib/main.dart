@@ -242,6 +242,47 @@ class _SenderPanelState extends State<SenderPanel> {
         ? 0
         : (_sentFrames * 1000.0 / elapsedMs);
 
+    if (_running) {
+      return Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: <Widget>[
+            Expanded(child: _buildFramePreview(double.infinity)),
+            const SizedBox(height: 10),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _stopSending,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('停止发送'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '已发送 $_sentFrames 帧，当前 ${frameRateActual.toStringAsFixed(2)} fps',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                '发送中建议：将该窗口最大化并置于采集输出屏，仅保留码图区域。',
+                style: const TextStyle(
+                  color: Color(0xFF475569),
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.all(16),
       child: LayoutBuilder(
@@ -509,7 +550,9 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
           final bool stillExists = scanResult.videoDevices.any(
             (_DshowDeviceEntry e) => e.name == current,
           );
-          _selectedVideoDeviceName = stillExists ? current : null;
+          _selectedVideoDeviceName = stillExists
+              ? current
+              : scanResult.videoDevices.first.name;
           if (_selectedVideoDeviceName == null) {
             _deviceController.clear();
           } else {
@@ -1377,59 +1420,54 @@ class _DshowScanResult {
 }
 
 _DshowScanResult _parseDshowScanResult(String text) {
-  return _DshowScanResult(
-    videoDevices: _parseDshowSectionEntries(text, 'DirectShow video devices'),
-    audioDevices: _parseDshowSectionEntries(text, 'DirectShow audio devices'),
-  );
-}
-
-List<_DshowDeviceEntry> _parseDshowSectionEntries(String text, String marker) {
-  final List<_DshowDeviceEntry> devices = <_DshowDeviceEntry>[];
-  bool inSection = false;
+  final List<_DshowDeviceEntry> videos = <_DshowDeviceEntry>[];
+  final List<_DshowDeviceEntry> audios = <_DshowDeviceEntry>[];
+  final RegExp devicePattern = RegExp(r'"([^"]+)"\s+\((video|audio)\)');
+  final RegExp altPattern = RegExp(r'Alternative name\s+"([^"]+)"');
+  String? pendingKind;
   int? pendingIndex;
-  final RegExp quoted = RegExp(r'"([^"]+)"');
-  final bool expectVideo = marker.toLowerCase().contains('video');
-  final bool expectAudio = marker.toLowerCase().contains('audio');
 
-  for (final String line in text.split('\n')) {
-    if (line.contains(marker)) {
-      inSection = true;
-      pendingIndex = null;
+  for (final String rawLine in text.split('\n')) {
+    final String line = rawLine.trim();
+    if (line.isEmpty) {
       continue;
     }
-    if (!inSection) {
-      continue;
-    }
-    if (line.contains('DirectShow') && !line.contains(marker)) {
-      inSection = false;
-      pendingIndex = null;
-      continue;
-    }
-    final Match? match = quoted.firstMatch(line);
-    if (match == null) {
-      continue;
-    }
-    final String value = match.group(1)!;
-    if (line.contains('Alternative name')) {
-      if (pendingIndex != null) {
-        final _DshowDeviceEntry prev = devices[pendingIndex];
-        devices[pendingIndex] = _DshowDeviceEntry(
-          name: prev.name,
-          alternativeName: value,
-        );
+    final Match? deviceMatch = devicePattern.firstMatch(line);
+    if (deviceMatch != null) {
+      final String name = deviceMatch.group(1)!.trim();
+      final String kind = deviceMatch.group(2)!.toLowerCase();
+      if (kind == 'video') {
+        videos.add(_DshowDeviceEntry(name: name));
+        pendingKind = 'video';
+        pendingIndex = videos.length - 1;
+      } else {
+        audios.add(_DshowDeviceEntry(name: name));
+        pendingKind = 'audio';
+        pendingIndex = audios.length - 1;
       }
       continue;
     }
-    if (expectVideo && !line.toLowerCase().contains('(video)')) {
-      continue;
+
+    final Match? altMatch = altPattern.firstMatch(line);
+    if (altMatch != null && pendingKind != null && pendingIndex != null) {
+      final String alt = altMatch.group(1)!.trim();
+      if (pendingKind == 'video' && pendingIndex < videos.length) {
+        final _DshowDeviceEntry prev = videos[pendingIndex];
+        videos[pendingIndex] = _DshowDeviceEntry(
+          name: prev.name,
+          alternativeName: alt,
+        );
+      } else if (pendingKind == 'audio' && pendingIndex < audios.length) {
+        final _DshowDeviceEntry prev = audios[pendingIndex];
+        audios[pendingIndex] = _DshowDeviceEntry(
+          name: prev.name,
+          alternativeName: alt,
+        );
+      }
     }
-    if (expectAudio && !line.toLowerCase().contains('(audio)')) {
-      continue;
-    }
-    devices.add(_DshowDeviceEntry(name: value));
-    pendingIndex = devices.length - 1;
   }
-  return devices;
+
+  return _DshowScanResult(videoDevices: videos, audioDevices: audios);
 }
 
 _DshowDeviceEntry? _guessBestCaptureVideoDevice(
