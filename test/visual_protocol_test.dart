@@ -73,4 +73,37 @@ void main() {
     expect(envelope!.fileName, 'payload.dat');
     expect(envelope.fileBytes, orderedEquals(fileBytes));
   });
+
+  test('differential decoder handles low-contrast watermark samples', () {
+    final TransferSession session = VisualTransferEncoder.buildSession(
+      fileName: 'tiny.bin',
+      fileBytes: Uint8List.fromList(
+        List<int>.generate(1600, (int i) => i & 0xFF),
+      ),
+      repeatCount: 2,
+      transferId: 0x55667788,
+    );
+    final VisualPacket packet = session.schedule.firstWhere(
+      (VisualPacket p) => !p.isManifest,
+    );
+    final Uint8List frameBytes = packet.toFrameBytes();
+    final List<int> bits = VisualFrameBitCodec.bytesToBits(frameBytes);
+    final List<double> differential = List<double>.filled(bits.length, 0);
+    for (int i = 0; i < bits.length; i++) {
+      final double base = bits[i] == 1 ? 2.35 : -2.35;
+      differential[i] = base + (((i % 7) - 3) * 0.06);
+    }
+
+    final DecodedVisualFrame? decoded =
+        VisualFrameDecoder.decodeDifferentialSamples(differential);
+    expect(decoded, isNotNull);
+    expect(decoded!.packet.transferId, packet.transferId);
+    expect(decoded.packet.totalDataChunks, packet.totalDataChunks);
+    expect(decoded.packet.chunkIndex, packet.chunkIndex);
+    expect(decoded.packet.groupIndex, packet.groupIndex);
+    expect(decoded.packet.isParity, packet.isParity);
+    expect(decoded.packet.isManifest, packet.isManifest);
+    expect(decoded.packet.payloadSize, packet.payloadSize);
+    expect(decoded.packet.payload, orderedEquals(packet.payload));
+  });
 }

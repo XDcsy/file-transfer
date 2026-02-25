@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'visual_protocol.dart';
 
-enum SenderVisualStyle { reliableMono, reliableMonoSoft }
+enum SenderVisualStyle { reliableMono, reliableMonoSoft, watermarkSplit }
 
 enum SenderVisualLayout { centered, lowerRight }
 
@@ -119,7 +119,9 @@ class VisualFramePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final List<Color> colors = style == SenderVisualStyle.reliableMono
         ? const <Color>[Color(0xFF0D1113), Color(0xFF060709)]
-        : const <Color>[Color(0xFF0F172A), Color(0xFF10253F)];
+        : style == SenderVisualStyle.reliableMonoSoft
+        ? const <Color>[Color(0xFF0F172A), Color(0xFF10253F)]
+        : const <Color>[Color(0xFFE6EDF5), Color(0xFFD8E4F2)];
     final Paint bg = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topLeft,
@@ -146,9 +148,11 @@ class VisualFramePainter extends CustomPainter {
     final Paint white = Paint()..color = const Color(0xFFF7F8FA);
     final Paint black = Paint()..color = const Color(0xFF060606);
     final Paint border = Paint()
-      ..color = const Color(0xFFECEFF1)
+      ..color = style == SenderVisualStyle.watermarkSplit
+          ? const Color(0x66FFFFFF)
+          : const Color(0xFFECEFF1)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2
+      ..strokeWidth = style == SenderVisualStyle.watermarkSplit ? 0.8 : 1.2
       ..isAntiAlias = false;
 
     if (layout == SenderVisualLayout.lowerRight) {
@@ -169,10 +173,22 @@ class VisualFramePainter extends CustomPainter {
       canvas.drawRect(Offset.zero & size, ambient);
     }
 
-    canvas.drawRect(region, white);
+    if (style == SenderVisualStyle.watermarkSplit) {
+      final Paint overlay = Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: const <Color>[Color(0x1AFFFFFF), Color(0x10FFFFFF)],
+        ).createShader(region);
+      canvas.drawRect(region, overlay);
+    } else {
+      canvas.drawRect(region, white);
+    }
     canvas.drawRect(region, border);
 
     int bitIndex = 0;
+    final Paint highlight = Paint()..color = const Color(0x26FFFFFF);
+    final Paint shadow = Paint()..color = const Color(0x22000000);
     for (int r = 0; r < VisualProtocol.gridRows; r++) {
       for (int c = 0; c < VisualProtocol.gridCols; c++) {
         final bool isOne = _bits[bitIndex++] == 1;
@@ -182,8 +198,49 @@ class VisualFramePainter extends CustomPainter {
           g.cellWidth,
           g.cellHeight,
         );
-        canvas.drawRect(cell, isOne ? black : white);
+        if (style == SenderVisualStyle.watermarkSplit) {
+          final Rect left = Rect.fromLTWH(
+            cell.left,
+            cell.top,
+            cell.width / 2,
+            cell.height,
+          );
+          final Rect right = Rect.fromLTWH(
+            cell.left + cell.width / 2,
+            cell.top,
+            cell.width / 2,
+            cell.height,
+          );
+          canvas.drawRect(left, isOne ? highlight : shadow);
+          canvas.drawRect(right, isOne ? shadow : highlight);
+        } else {
+          canvas.drawRect(cell, isOne ? black : white);
+        }
       }
+    }
+    if (style == SenderVisualStyle.watermarkSplit) {
+      final double markW = g.cellWidth * 5;
+      final double markH = g.cellHeight * 5;
+      final Paint markLight = Paint()..color = const Color(0x4DFFFFFF);
+      final Paint markDark = Paint()..color = const Color(0x33000000);
+      canvas.drawRect(Rect.fromLTWH(g.left, g.top, markW, markH), markLight);
+      canvas.drawRect(
+        Rect.fromLTWH(g.left + g.width - markW, g.top, markW, markH),
+        markDark,
+      );
+      canvas.drawRect(
+        Rect.fromLTWH(g.left, g.top + g.height - markH, markW, markH),
+        markDark,
+      );
+      canvas.drawRect(
+        Rect.fromLTWH(
+          g.left + g.width - markW,
+          g.top + g.height - markH,
+          markW,
+          markH,
+        ),
+        markLight,
+      );
     }
 
     if (subtitle.isEmpty) {
@@ -474,24 +531,48 @@ class VisualFrameSampler {
     required int height,
     required VisualFrameGeometry geometry,
   }) {
-    final List<List<double>> sampleSets = <List<double>>[
-      _sampleFromRawWithGeometry(
-        rawRgba: rawRgba,
-        width: width,
-        height: height,
-        geometry: geometry,
+    final List<_SampleSet> sampleSets = <_SampleSet>[
+      _SampleSet(
+        values: _sampleFromRawWithGeometry(
+          rawRgba: rawRgba,
+          width: width,
+          height: height,
+          geometry: geometry,
+        ),
+        differential: false,
       ),
-      _sampleFromRawWithNestedGeometry(
-        rawRgba: rawRgba,
-        width: width,
-        height: height,
-        outer: geometry,
+      _SampleSet(
+        values: _sampleFromRawWithNestedGeometry(
+          rawRgba: rawRgba,
+          width: width,
+          height: height,
+          outer: geometry,
+        ),
+        differential: false,
+      ),
+      _SampleSet(
+        values: _sampleDifferentialFromRawWithGeometry(
+          rawRgba: rawRgba,
+          width: width,
+          height: height,
+          geometry: geometry,
+        ),
+        differential: true,
+      ),
+      _SampleSet(
+        values: _sampleDifferentialFromRawWithNestedGeometry(
+          rawRgba: rawRgba,
+          width: width,
+          height: height,
+          outer: geometry,
+        ),
+        differential: true,
       ),
     ];
-    for (final List<double> samples in sampleSets) {
-      final DecodedVisualFrame? decoded = VisualFrameDecoder.decodeLumaSamples(
-        samples,
-      );
+    for (final _SampleSet sample in sampleSets) {
+      final DecodedVisualFrame? decoded = sample.differential
+          ? VisualFrameDecoder.decodeDifferentialSamples(sample.values)
+          : VisualFrameDecoder.decodeLumaSamples(sample.values);
       if (decoded != null) {
         return DecodedFrameCandidate(
           decoded: decoded,
@@ -699,6 +780,86 @@ class VisualFrameSampler {
       geometry: mapped,
     );
   }
+
+  static List<double> _sampleDifferentialFromRawWithGeometry({
+    required ByteData rawRgba,
+    required int width,
+    required int height,
+    required VisualFrameGeometry geometry,
+  }) {
+    final List<double> samples = List<double>.filled(
+      VisualProtocol.gridCols * VisualProtocol.gridRows,
+      0.0,
+      growable: false,
+    );
+
+    int sampleIndex = 0;
+    for (int r = 0; r < VisualProtocol.gridRows; r++) {
+      for (int c = 0; c < VisualProtocol.gridCols; c++) {
+        double leftAcc = 0;
+        double rightAcc = 0;
+        int lumaCount = 0;
+        for (final double oy in <double>[0.28, 0.50, 0.72]) {
+          final double y = geometry.top + (r + oy) * geometry.cellHeight;
+          final int py = y.clamp(0, height - 1).toInt();
+          for (final double ox in <double>[0.18, 0.30, 0.42]) {
+            final double xl = geometry.left + (c + ox) * geometry.cellWidth;
+            final double xr =
+                geometry.left + (c + (1.0 - ox)) * geometry.cellWidth;
+            final int pxLeft = xl.clamp(0, width - 1).toInt();
+            final int pxRight = xr.clamp(0, width - 1).toInt();
+            leftAcc += _pixelLuma(rawRgba, width, pxLeft, py);
+            rightAcc += _pixelLuma(rawRgba, width, pxRight, py);
+            lumaCount++;
+          }
+        }
+        final double leftAvg = leftAcc / lumaCount;
+        final double rightAvg = rightAcc / lumaCount;
+        samples[sampleIndex++] = leftAvg - rightAvg;
+      }
+    }
+    return samples;
+  }
+
+  static List<double> _sampleDifferentialFromRawWithNestedGeometry({
+    required ByteData rawRgba,
+    required int width,
+    required int height,
+    required VisualFrameGeometry outer,
+  }) {
+    final VisualFrameGeometry inner = VisualFrameGeometry.fromSize(
+      Size(outer.width, outer.height),
+    );
+    final VisualFrameGeometry mapped = VisualFrameGeometry(
+      left: outer.left + inner.left,
+      top: outer.top + inner.top,
+      width: inner.width,
+      height: inner.height,
+      cellWidth: inner.width / VisualProtocol.gridCols,
+      cellHeight: inner.height / VisualProtocol.gridRows,
+    );
+    return _sampleDifferentialFromRawWithGeometry(
+      rawRgba: rawRgba,
+      width: width,
+      height: height,
+      geometry: mapped,
+    );
+  }
+
+  static double _pixelLuma(ByteData rawRgba, int width, int x, int y) {
+    final int offset = ((y * width) + x) * 4;
+    final int r8 = rawRgba.getUint8(offset);
+    final int g8 = rawRgba.getUint8(offset + 1);
+    final int b8 = rawRgba.getUint8(offset + 2);
+    return (0.2126 * r8) + (0.7152 * g8) + (0.0722 * b8);
+  }
+}
+
+class _SampleSet {
+  const _SampleSet({required this.values, required this.differential});
+
+  final List<double> values;
+  final bool differential;
 }
 
 class _GeometryScore {

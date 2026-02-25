@@ -772,6 +772,76 @@ class VisualFrameDecoder {
     );
   }
 
+  static DecodedVisualFrame? decodeDifferentialSamples(
+    List<double> differentialSamples,
+  ) {
+    final int expectedSamples =
+        VisualProtocol.gridCols * VisualProtocol.gridRows;
+    if (differentialSamples.length != expectedSamples) {
+      return null;
+    }
+
+    final List<int> expectedPreambleBits = VisualFrameBitCodec.bytesToBits(
+      Uint8List.fromList(VisualProtocol.preamble),
+    );
+    if (expectedPreambleBits.length < 64) {
+      return null;
+    }
+
+    double oneSum = 0;
+    double zeroSum = 0;
+    int oneCount = 0;
+    int zeroCount = 0;
+    for (int i = 0; i < 64; i++) {
+      if (expectedPreambleBits[i] == 1) {
+        oneSum += differentialSamples[i];
+        oneCount++;
+      } else {
+        zeroSum += differentialSamples[i];
+        zeroCount++;
+      }
+    }
+    if (oneCount == 0 || zeroCount == 0) {
+      return null;
+    }
+
+    final double avgOne = oneSum / oneCount;
+    final double avgZero = zeroSum / zeroCount;
+    final double threshold = (avgOne + avgZero) / 2.0;
+    if ((avgOne - avgZero).abs() < 1.2) {
+      return null;
+    }
+
+    final bool oneIsPositivePrimary = avgOne > avgZero;
+    Uint8List? frameBytes = _decodeDifferentialWithMapping(
+      differentialSamples: differentialSamples,
+      threshold: threshold,
+      oneIsPositive: oneIsPositivePrimary,
+    );
+    bool inverted = false;
+    if (frameBytes == null) {
+      frameBytes = _decodeDifferentialWithMapping(
+        differentialSamples: differentialSamples,
+        threshold: threshold,
+        oneIsPositive: !oneIsPositivePrimary,
+      );
+      inverted = true;
+    }
+    if (frameBytes == null) {
+      return null;
+    }
+
+    final VisualPacket? packet = VisualPacket.fromFrameBytes(frameBytes);
+    if (packet == null) {
+      return null;
+    }
+    return DecodedVisualFrame(
+      packet: packet,
+      threshold: threshold,
+      inverted: inverted,
+    );
+  }
+
   static Uint8List? _decodeWithMapping({
     required List<double> lumaSamples,
     required double threshold,
@@ -787,6 +857,30 @@ class VisualFrameDecoder {
       final int bit = oneIsDark
           ? (l < threshold ? 1 : 0)
           : (l > threshold ? 1 : 0);
+      bits[i] = bit;
+    }
+    final Uint8List bytes = VisualFrameBitCodec.bitsToBytes(bits);
+    if (!_bytesEqual(bytes, 0, VisualProtocol.preamble)) {
+      return null;
+    }
+    return bytes;
+  }
+
+  static Uint8List? _decodeDifferentialWithMapping({
+    required List<double> differentialSamples,
+    required double threshold,
+    required bool oneIsPositive,
+  }) {
+    final List<int> bits = List<int>.filled(
+      differentialSamples.length,
+      0,
+      growable: false,
+    );
+    for (int i = 0; i < differentialSamples.length; i++) {
+      final double d = differentialSamples[i];
+      final int bit = oneIsPositive
+          ? (d > threshold ? 1 : 0)
+          : (d < threshold ? 1 : 0);
       bits[i] = bit;
     }
     final Uint8List bytes = VisualFrameBitCodec.bitsToBytes(bits);

@@ -6,13 +6,30 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'src/visual_frame_codec.dart';
 import 'src/frame_archive.dart';
 import 'src/mjpeg_parser.dart';
 import 'src/visual_protocol.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    await windowManager.ensureInitialized();
+    const WindowOptions windowOptions = WindowOptions(
+      title: 'Capture Vision Transfer',
+      minimumSize: Size(780, 560),
+      size: Size(1240, 860),
+      center: true,
+      skipTaskbar: false,
+      titleBarStyle: TitleBarStyle.normal,
+    );
+    windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  }
   runApp(const CaptureVisionApp());
 }
 
@@ -115,7 +132,11 @@ class _SenderPanelState extends State<SenderPanel> {
   _SenderDisplayPreset _displayPreset = _SenderDisplayPreset.immersive;
   SenderVisualStyle _visualStyle = SenderVisualStyle.reliableMono;
   SenderVisualLayout _visualLayout = SenderVisualLayout.centered;
+  SenderVisualStyle _activeFrameStyle = SenderVisualStyle.reliableMono;
   double _visualWidthFraction = 0.97;
+  Rect? _savedWindowBounds;
+  bool? _savedWindowAlwaysOnTop;
+  bool _windowAdjustedForFloating = false;
   int _scheduleIndex = 0;
   int _sentFrames = 0;
   DateTime? _startedAt;
@@ -154,9 +175,60 @@ class _SenderPanelState extends State<SenderPanel> {
       _visualLayout = SenderVisualLayout.centered;
       _visualWidthFraction = 0.97;
     } else {
-      _visualStyle = SenderVisualStyle.reliableMonoSoft;
+      _visualStyle = SenderVisualStyle.watermarkSplit;
       _visualLayout = SenderVisualLayout.lowerRight;
-      _visualWidthFraction = 0.42;
+      _visualWidthFraction = 0.30;
+    }
+    _activeFrameStyle = _visualStyle;
+  }
+
+  bool get _canControlWindow =>
+      Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+
+  Future<void> _prepareSenderWindow() async {
+    if (!_canControlWindow) {
+      return;
+    }
+    try {
+      _savedWindowBounds = await windowManager.getBounds();
+      _savedWindowAlwaysOnTop = await windowManager.isAlwaysOnTop();
+      if (_displayPreset != _SenderDisplayPreset.floating) {
+        _windowAdjustedForFloating = false;
+        return;
+      }
+      await windowManager.setAlwaysOnTop(true);
+      await windowManager.setMinimumSize(const Size(420, 280));
+      await windowManager.setSize(const Size(560, 360));
+      _windowAdjustedForFloating = true;
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _message = '窗口调整失败（可忽略，手动缩小窗口即可）: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _restoreSenderWindow() async {
+    if (!_canControlWindow || !_windowAdjustedForFloating) {
+      return;
+    }
+    try {
+      final bool shouldAlwaysOnTop = _savedWindowAlwaysOnTop ?? false;
+      await windowManager.setAlwaysOnTop(shouldAlwaysOnTop);
+      final Rect? savedBounds = _savedWindowBounds;
+      if (savedBounds != null) {
+        await windowManager.setSize(
+          Size(savedBounds.width, savedBounds.height),
+        );
+        await windowManager.setPosition(
+          Offset(savedBounds.left, savedBounds.top),
+        );
+      }
+    } catch (_) {
+      // ignore restore failures
+    } finally {
+      _windowAdjustedForFloating = false;
     }
   }
 
@@ -200,6 +272,7 @@ class _SenderPanelState extends State<SenderPanel> {
       fileBytes: bytes,
       repeatCount: repeat,
     );
+    await _prepareSenderWindow();
 
     _timer?.cancel();
     _scheduleIndex = 0;
@@ -207,7 +280,9 @@ class _SenderPanelState extends State<SenderPanel> {
     _startedAt = DateTime.now();
     _running = true;
     _session = session;
-    _message = '已启动发送。建议接收端至少录制 ${session.recommendedCaptureFrames} 帧后再离线解析。';
+    _message = _displayPreset == _SenderDisplayPreset.floating
+        ? '已启动低打扰发送。窗口会缩小置顶，接收端建议录制 ${session.recommendedCaptureFrames} 帧后离线解析。'
+        : '已启动发送。建议接收端至少录制 ${session.recommendedCaptureFrames} 帧后再离线解析。';
 
     _pushNextFrame();
     _timer = Timer.periodic(
@@ -226,7 +301,16 @@ class _SenderPanelState extends State<SenderPanel> {
     final VisualPacket packet =
         session.schedule[_scheduleIndex % session.schedule.length];
     _currentFrame = packet.toFrameBytes();
-    _subtitle = '';
+    if (_displayPreset == _SenderDisplayPreset.floating) {
+      final bool keyframe = packet.isManifest || (_sentFrames % 18 == 0);
+      _activeFrameStyle = keyframe
+          ? SenderVisualStyle.reliableMonoSoft
+          : SenderVisualStyle.watermarkSplit;
+      _subtitle = keyframe ? 'KF' : '';
+    } else {
+      _activeFrameStyle = _visualStyle;
+      _subtitle = '';
+    }
     _scheduleIndex++;
     _sentFrames++;
     setState(() {});
@@ -235,6 +319,7 @@ class _SenderPanelState extends State<SenderPanel> {
   void _stopSending() {
     _timer?.cancel();
     _timer = null;
+    unawaited(_restoreSenderWindow());
     if (_running) {
       setState(() {
         _running = false;
@@ -290,7 +375,7 @@ class _SenderPanelState extends State<SenderPanel> {
               child: Text(
                 _displayPreset == _SenderDisplayPreset.immersive
                     ? '发送中建议：将该窗口最大化并置于采集输出屏。'
-                    : '发送中建议：可保留悬浮模式，接收端会在离线解析阶段全量重扫。',
+                    : '发送中建议：已启用差分水印调制与小窗置顶，主屏可继续工作。',
                 style: const TextStyle(
                   color: Color(0xFF475569),
                   fontWeight: FontWeight.w600,
@@ -388,7 +473,7 @@ class _SenderPanelState extends State<SenderPanel> {
                 ),
                 DropdownMenuItem<_SenderDisplayPreset>(
                   value: _SenderDisplayPreset.floating,
-                  child: Text('低打扰悬浮'),
+                  child: Text('低打扰水印悬浮'),
                 ),
               ],
               onChanged: _running
@@ -401,6 +486,16 @@ class _SenderPanelState extends State<SenderPanel> {
                         _applyDisplayPreset(value);
                       });
                     },
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _displayPreset == _SenderDisplayPreset.floating
+                  ? '低打扰模式：小窗置顶 + 差分水印调制（离线解码）'
+                  : '高可靠模式：高对比二值码',
+              style: const TextStyle(
+                color: Color(0xFF475569),
+                fontWeight: FontWeight.w600,
+              ),
             ),
             const SizedBox(height: 6),
             Text('码图宽度占屏: ${(_visualWidthFraction * 100).toStringAsFixed(0)}%'),
@@ -484,7 +579,7 @@ class _SenderPanelState extends State<SenderPanel> {
             painter: VisualFramePainter(
               frameBytes: _currentFrame,
               subtitle: _subtitle,
-              style: _visualStyle,
+              style: _activeFrameStyle,
               layout: _visualLayout,
               widthFraction: _visualWidthFraction,
             ),
