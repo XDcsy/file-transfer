@@ -7,6 +7,8 @@ import 'visual_protocol.dart';
 
 enum SenderVisualStyle { reliableMono, reliableMonoSoft }
 
+enum SenderVisualLayout { centered, lowerRight }
+
 class VisualFrameGeometry {
   const VisualFrameGeometry({
     required this.left,
@@ -102,18 +104,22 @@ class VisualFramePainter extends CustomPainter {
     required this.frameBytes,
     required this.subtitle,
     this.style = SenderVisualStyle.reliableMonoSoft,
+    this.layout = SenderVisualLayout.centered,
+    this.widthFraction = 0.97,
   }) : _bits = VisualFrameBitCodec.bytesToBits(frameBytes);
 
   final Uint8List frameBytes;
   final String subtitle;
   final SenderVisualStyle style;
+  final SenderVisualLayout layout;
+  final double widthFraction;
   final List<int> _bits;
 
   @override
   void paint(Canvas canvas, Size size) {
     final List<Color> colors = style == SenderVisualStyle.reliableMono
-        ? const <Color>[Color(0xFF101213), Color(0xFF08090A)]
-        : const <Color>[Color(0xFF0F172A), Color(0xFF0B1222)];
+        ? const <Color>[Color(0xFF0D1113), Color(0xFF060709)]
+        : const <Color>[Color(0xFF0F172A), Color(0xFF10253F)];
     final Paint bg = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topLeft,
@@ -122,7 +128,20 @@ class VisualFramePainter extends CustomPainter {
       ).createShader(Offset.zero & size);
     canvas.drawRect(Offset.zero & size, bg);
 
-    final VisualFrameGeometry g = VisualFrameGeometry.fromSize(size);
+    final double targetWidth = widthFraction.clamp(0.22, 0.98);
+    final VisualFrameGeometry g = layout == SenderVisualLayout.centered
+        ? VisualFrameGeometry.fromCenterAndWidthFraction(
+            size: size,
+            centerXFraction: 0.5,
+            centerYFraction: 0.5,
+            widthFraction: targetWidth,
+          )
+        : VisualFrameGeometry.fromCenterAndWidthFraction(
+            size: size,
+            centerXFraction: 0.74,
+            centerYFraction: 0.68,
+            widthFraction: targetWidth,
+          );
     final Rect region = Rect.fromLTWH(g.left, g.top, g.width, g.height);
     final Paint white = Paint()..color = const Color(0xFFF7F8FA);
     final Paint black = Paint()..color = const Color(0xFF060606);
@@ -131,6 +150,25 @@ class VisualFramePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2
       ..isAntiAlias = false;
+
+    if (layout == SenderVisualLayout.lowerRight) {
+      final Paint ambient = Paint()
+        ..shader =
+            RadialGradient(
+              colors: <Color>[const Color(0x3322D3EE), const Color(0x00000000)],
+              stops: const <double>[0, 1],
+            ).createShader(
+              Rect.fromCircle(
+                center: Offset(
+                  g.left + g.width * 0.45,
+                  g.top + g.height * 0.45,
+                ),
+                radius: g.width * 0.9,
+              ),
+            );
+      canvas.drawRect(Offset.zero & size, ambient);
+    }
+
     canvas.drawRect(region, white);
     canvas.drawRect(region, border);
 
@@ -169,6 +207,11 @@ class VisualFramePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant VisualFramePainter oldDelegate) {
     if (oldDelegate.subtitle != subtitle) {
+      return true;
+    }
+    if (oldDelegate.style != style ||
+        oldDelegate.layout != layout ||
+        oldDelegate.widthFraction != widthFraction) {
       return true;
     }
     if (oldDelegate.frameBytes.length != frameBytes.length) {

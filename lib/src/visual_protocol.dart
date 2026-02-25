@@ -13,6 +13,9 @@ class VisualProtocol {
 
   static const int version = 1;
   static const int flagParity = 0x01;
+  static const int flagManifest = 0x02;
+  static const int manifestPacketsPerLoop = 4;
+  static const int recommendedCaptureLoops = 3;
 
   static const List<int> preamble = <int>[
     0xAA,
@@ -27,6 +30,7 @@ class VisualProtocol {
 
   static const List<int> frameMagic = <int>[0x43, 0x56, 0x54, 0x31]; // CVT1
   static const List<int> envelopeMagic = <int>[0x46, 0x49, 0x4C, 0x45]; // FILE
+  static const List<int> manifestMagic = <int>[0x4D, 0x45, 0x54, 0x41]; // META
 }
 
 class Crc32 {
@@ -107,6 +111,108 @@ class FileEnvelope {
   }
 }
 
+class TransferManifest {
+  const TransferManifest({
+    required this.transferId,
+    required this.totalDataChunks,
+    required this.packedBytesLength,
+    required this.fileBytesLength,
+    required this.packetsPerLoop,
+    required this.repeatCount,
+    required this.recommendedCaptureFrames,
+    required this.fileName,
+  });
+
+  final int transferId;
+  final int totalDataChunks;
+  final int packedBytesLength;
+  final int fileBytesLength;
+  final int packetsPerLoop;
+  final int repeatCount;
+  final int recommendedCaptureFrames;
+  final String fileName;
+
+  Uint8List pack() {
+    const int fixedBytes = 4 + 1 + 2 + 4 + 8 + 8 + 4 + 1 + 4;
+    final int maxNameBytes = max(
+      0,
+      VisualProtocol.maxPayloadBytes - fixedBytes,
+    );
+    Uint8List nameBytes = Uint8List.fromList(utf8.encode(fileName));
+    if (nameBytes.length > maxNameBytes) {
+      nameBytes = Uint8List.fromList(nameBytes.sublist(0, maxNameBytes));
+    }
+
+    final Uint8List out = Uint8List(fixedBytes + nameBytes.length);
+    out.setRange(0, 4, VisualProtocol.manifestMagic);
+    out[4] = 1;
+
+    final ByteData bd = ByteData.sublistView(out);
+    bd.setUint16(5, nameBytes.length, Endian.little);
+    bd.setUint32(7, totalDataChunks, Endian.little);
+    bd.setUint64(11, packedBytesLength, Endian.little);
+    bd.setUint64(19, fileBytesLength, Endian.little);
+    bd.setUint32(27, packetsPerLoop, Endian.little);
+    out[31] = repeatCount.clamp(1, 255).toInt();
+    bd.setUint32(32, recommendedCaptureFrames, Endian.little);
+    out.setRange(36, out.length, nameBytes);
+    return out;
+  }
+
+  static TransferManifest? unpack(
+    Uint8List payload, {
+    required int transferId,
+    int? payloadSize,
+  }) {
+    const int fixedBytes = 36;
+    final int len = min(payload.length, payloadSize ?? payload.length);
+    if (len < fixedBytes) {
+      return null;
+    }
+    if (!_bytesEqual(payload, 0, VisualProtocol.manifestMagic)) {
+      return null;
+    }
+    if (payload[4] != 1) {
+      return null;
+    }
+
+    final ByteData bd = ByteData.sublistView(payload);
+    final int nameLen = bd.getUint16(5, Endian.little);
+    if (len < fixedBytes + nameLen) {
+      return null;
+    }
+
+    final int totalDataChunks = bd.getUint32(7, Endian.little);
+    final int packedBytesLength = bd.getUint64(11, Endian.little);
+    final int fileBytesLength = bd.getUint64(19, Endian.little);
+    final int packetsPerLoop = bd.getUint32(27, Endian.little);
+    final int repeatCount = max(1, payload[31]);
+    final int recommendedCaptureFrames = bd.getUint32(32, Endian.little);
+    if (totalDataChunks <= 0 ||
+        packedBytesLength <= 0 ||
+        fileBytesLength < 0 ||
+        packetsPerLoop <= 0 ||
+        recommendedCaptureFrames <= 0) {
+      return null;
+    }
+
+    final String fileName = utf8.decode(
+      payload.sublist(36, 36 + nameLen),
+      allowMalformed: true,
+    );
+    return TransferManifest(
+      transferId: transferId,
+      totalDataChunks: totalDataChunks,
+      packedBytesLength: packedBytesLength,
+      fileBytesLength: fileBytesLength,
+      packetsPerLoop: packetsPerLoop,
+      repeatCount: repeatCount,
+      recommendedCaptureFrames: recommendedCaptureFrames,
+      fileName: fileName,
+    );
+  }
+}
+
 class VisualPacket {
   const VisualPacket({
     required this.transferId,
@@ -114,6 +220,7 @@ class VisualPacket {
     required this.chunkIndex,
     required this.groupIndex,
     required this.isParity,
+    this.isManifest = false,
     required this.payload,
     required this.payloadSize,
   });
@@ -123,6 +230,7 @@ class VisualPacket {
   final int chunkIndex;
   final int groupIndex;
   final bool isParity;
+  final bool isManifest;
   final Uint8List payload;
   final int payloadSize;
 
@@ -131,7 +239,14 @@ class VisualPacket {
     out.setRange(0, 8, VisualProtocol.preamble);
     out.setRange(8, 12, VisualProtocol.frameMagic);
     out[12] = VisualProtocol.version;
-    out[13] = isParity ? VisualProtocol.flagParity : 0;
+    int flags = 0;
+    if (isParity) {
+      flags |= VisualProtocol.flagParity;
+    }
+    if (isManifest) {
+      flags |= VisualProtocol.flagManifest;
+    }
+    out[13] = flags;
 
     final ByteData bd = ByteData.sublistView(out);
     bd.setUint16(14, VisualProtocol.headerBytes, Endian.little);
@@ -208,6 +323,7 @@ class VisualPacket {
       chunkIndex: chunkIndex,
       groupIndex: groupIndex,
       isParity: (frameBytes[13] & VisualProtocol.flagParity) != 0,
+      isManifest: (frameBytes[13] & VisualProtocol.flagManifest) != 0,
       payload: payload,
       payloadSize: payloadSize,
     );
@@ -219,24 +335,31 @@ class TransferSession {
     required this.transferId,
     required this.fileName,
     required this.fileBytes,
+    required this.packedBytesLength,
     required this.totalDataChunks,
+    required this.packetsPerLoop,
+    required this.recommendedCaptureFrames,
+    required this.repeatCount,
+    required this.manifest,
     required this.schedule,
   });
 
   final int transferId;
   final String fileName;
   final Uint8List fileBytes;
+  final int packedBytesLength;
   final int totalDataChunks;
+  final int packetsPerLoop;
+  final int recommendedCaptureFrames;
+  final int repeatCount;
+  final TransferManifest manifest;
   final List<VisualPacket> schedule;
 
-  double estimatedPayloadThroughputBytesPerSecond({
-    required double fps,
-    required int repeatCount,
-  }) {
-    final double usefulRatio =
-        VisualProtocol.dataPerGroup / (VisualProtocol.dataPerGroup + 1);
-    return (VisualProtocol.chunkPayloadBytes * fps * usefulRatio) /
-        max(1, repeatCount);
+  double estimatedPayloadThroughputBytesPerSecond({required double fps}) {
+    if (packetsPerLoop <= 0 || fileBytes.isEmpty) {
+      return 0;
+    }
+    return (fileBytes.length * fps) / packetsPerLoop;
   }
 }
 
@@ -288,6 +411,7 @@ class VisualTransferEncoder {
             chunkIndex: p.chunkIndex,
             groupIndex: p.groupIndex,
             isParity: p.isParity,
+            isManifest: false,
             payload: p.payload,
             payloadSize: p.payloadSize,
           ),
@@ -316,6 +440,7 @@ class VisualTransferEncoder {
           chunkIndex: group,
           groupIndex: group,
           isParity: true,
+          isManifest: false,
           payload: parity,
           payloadSize: parity.length,
         ),
@@ -323,17 +448,60 @@ class VisualTransferEncoder {
     }
 
     final List<VisualPacket> round = _interleave(normalizedData, parityPackets);
-    final List<VisualPacket> schedule = <VisualPacket>[];
     final int repeat = max(1, repeatCount);
-    for (int i = 0; i < repeat; i++) {
-      schedule.addAll(round);
+    final List<VisualPacket> repeatedRound = <VisualPacket>[];
+    for (final VisualPacket packet in round) {
+      for (int i = 0; i < repeat; i++) {
+        repeatedRound.add(packet);
+      }
+    }
+
+    final int packetsPerLoop =
+        repeatedRound.length + VisualProtocol.manifestPacketsPerLoop;
+    final int recommendedCaptureFrames =
+        packetsPerLoop * VisualProtocol.recommendedCaptureLoops;
+    final TransferManifest manifest = TransferManifest(
+      transferId: sessionId,
+      totalDataChunks: totalDataChunks,
+      packedBytesLength: packed.length,
+      fileBytesLength: fileBytes.length,
+      packetsPerLoop: packetsPerLoop,
+      repeatCount: repeat,
+      recommendedCaptureFrames: recommendedCaptureFrames,
+      fileName: fileName,
+    );
+    final Uint8List manifestPayload = manifest.pack();
+    final VisualPacket manifestPacket = VisualPacket(
+      transferId: sessionId,
+      totalDataChunks: totalDataChunks,
+      chunkIndex: 0,
+      groupIndex: 0,
+      isParity: false,
+      isManifest: true,
+      payload: manifestPayload,
+      payloadSize: manifestPayload.length,
+    );
+
+    final int headManifest = VisualProtocol.manifestPacketsPerLoop ~/ 2;
+    final List<VisualPacket> schedule = <VisualPacket>[];
+    for (int i = 0; i < headManifest; i++) {
+      schedule.add(manifestPacket);
+    }
+    schedule.addAll(repeatedRound);
+    for (int i = headManifest; i < VisualProtocol.manifestPacketsPerLoop; i++) {
+      schedule.add(manifestPacket);
     }
 
     return TransferSession(
       transferId: sessionId,
       fileName: fileName,
       fileBytes: fileBytes,
+      packedBytesLength: packed.length,
       totalDataChunks: totalDataChunks,
+      packetsPerLoop: packetsPerLoop,
+      recommendedCaptureFrames: recommendedCaptureFrames,
+      repeatCount: repeat,
+      manifest: manifest,
       schedule: schedule,
     );
   }
@@ -396,6 +564,9 @@ class TransferAssembler {
   bool accept(VisualPacket packet) {
     if (packet.transferId != transferId ||
         packet.totalDataChunks != totalDataChunks) {
+      return false;
+    }
+    if (packet.isManifest) {
       return false;
     }
     bool changed = false;

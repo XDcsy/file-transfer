@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart';
 
 import 'src/visual_frame_codec.dart';
+import 'src/frame_archive.dart';
 import 'src/mjpeg_parser.dart';
 import 'src/visual_protocol.dart';
 
@@ -88,6 +90,8 @@ class _WorkbenchPageState extends State<WorkbenchPage>
   }
 }
 
+enum _SenderDisplayPreset { immersive, floating }
+
 class SenderPanel extends StatefulWidget {
   const SenderPanel({super.key});
 
@@ -108,6 +112,10 @@ class _SenderPanelState extends State<SenderPanel> {
   Timer? _timer;
   Uint8List _currentFrame = Uint8List(VisualProtocol.frameBytes);
   String _subtitle = '等待开始';
+  _SenderDisplayPreset _displayPreset = _SenderDisplayPreset.immersive;
+  SenderVisualStyle _visualStyle = SenderVisualStyle.reliableMono;
+  SenderVisualLayout _visualLayout = SenderVisualLayout.centered;
+  double _visualWidthFraction = 0.97;
   int _scheduleIndex = 0;
   int _sentFrames = 0;
   DateTime? _startedAt;
@@ -136,6 +144,19 @@ class _SenderPanelState extends State<SenderPanel> {
       setState(() {
         _message = '打开文件选择器失败: $e';
       });
+    }
+  }
+
+  void _applyDisplayPreset(_SenderDisplayPreset preset) {
+    _displayPreset = preset;
+    if (preset == _SenderDisplayPreset.immersive) {
+      _visualStyle = SenderVisualStyle.reliableMono;
+      _visualLayout = SenderVisualLayout.centered;
+      _visualWidthFraction = 0.97;
+    } else {
+      _visualStyle = SenderVisualStyle.reliableMonoSoft;
+      _visualLayout = SenderVisualLayout.lowerRight;
+      _visualWidthFraction = 0.42;
     }
   }
 
@@ -186,7 +207,7 @@ class _SenderPanelState extends State<SenderPanel> {
     _startedAt = DateTime.now();
     _running = true;
     _session = session;
-    _message = '已启动发送。将窗口拖到采集卡输出屏并全屏显示。';
+    _message = '已启动发送。建议接收端至少录制 ${session.recommendedCaptureFrames} 帧后再离线解析。';
 
     _pushNextFrame();
     _timer = Timer.periodic(
@@ -226,13 +247,9 @@ class _SenderPanelState extends State<SenderPanel> {
   Widget build(BuildContext context) {
     final TransferSession? session = _session;
     final double fps = double.tryParse(_fpsController.text.trim()) ?? 12;
-    final int repeat = int.tryParse(_repeatController.text.trim()) ?? 1;
     final double throughput = session == null
         ? 0
-        : session.estimatedPayloadThroughputBytesPerSecond(
-            fps: fps,
-            repeatCount: repeat,
-          );
+        : session.estimatedPayloadThroughputBytesPerSecond(fps: fps);
 
     final Duration elapsed = _startedAt == null
         ? Duration.zero
@@ -271,7 +288,9 @@ class _SenderPanelState extends State<SenderPanel> {
             Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                '发送中建议：将该窗口最大化并置于采集输出屏，仅保留码图区域。',
+                _displayPreset == _SenderDisplayPreset.immersive
+                    ? '发送中建议：将该窗口最大化并置于采集输出屏。'
+                    : '发送中建议：可保留悬浮模式，接收端会在离线解析阶段全量重扫。',
                 style: const TextStyle(
                   color: Color(0xFF475569),
                   fontWeight: FontWeight.w600,
@@ -358,6 +377,46 @@ class _SenderPanelState extends State<SenderPanel> {
                 ),
               ],
             ),
+            const SizedBox(height: 10),
+            DropdownButtonFormField<_SenderDisplayPreset>(
+              initialValue: _displayPreset,
+              decoration: const InputDecoration(labelText: '显示模式'),
+              items: const <DropdownMenuItem<_SenderDisplayPreset>>[
+                DropdownMenuItem<_SenderDisplayPreset>(
+                  value: _SenderDisplayPreset.immersive,
+                  child: Text('全屏高可靠'),
+                ),
+                DropdownMenuItem<_SenderDisplayPreset>(
+                  value: _SenderDisplayPreset.floating,
+                  child: Text('低打扰悬浮'),
+                ),
+              ],
+              onChanged: _running
+                  ? null
+                  : (_SenderDisplayPreset? value) {
+                      if (value == null) {
+                        return;
+                      }
+                      setState(() {
+                        _applyDisplayPreset(value);
+                      });
+                    },
+            ),
+            const SizedBox(height: 6),
+            Text('码图宽度占屏: ${(_visualWidthFraction * 100).toStringAsFixed(0)}%'),
+            Slider(
+              value: _visualWidthFraction.clamp(0.22, 0.98),
+              min: 0.22,
+              max: 0.98,
+              divisions: 38,
+              onChanged: _running
+                  ? null
+                  : (double value) {
+                      setState(() {
+                        _visualWidthFraction = value;
+                      });
+                    },
+            ),
             const SizedBox(height: 12),
             Row(
               children: <Widget>[
@@ -386,6 +445,11 @@ class _SenderPanelState extends State<SenderPanel> {
               session == null ? '-' : _formatBytes(session.fileBytes.length),
             ),
             _kv('数据分片数', session == null ? '-' : '${session.totalDataChunks}'),
+            _kv('每轮帧数', session == null ? '-' : '${session.packetsPerLoop}'),
+            _kv(
+              '建议录制帧',
+              session == null ? '-' : '${session.recommendedCaptureFrames}',
+            ),
             _kv('编码速率估算', '${_formatBytes(throughput.round())}/s'),
             _kv(
               '实际渲染帧率',
@@ -420,6 +484,9 @@ class _SenderPanelState extends State<SenderPanel> {
             painter: VisualFramePainter(
               frameBytes: _currentFrame,
               subtitle: _subtitle,
+              style: _visualStyle,
+              layout: _visualLayout,
+              widthFraction: _visualWidthFraction,
             ),
           ),
         ),
@@ -453,17 +520,27 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
   StreamSubscription<List<int>>? _captureStdoutSub;
   StreamSubscription<List<int>>? _captureStderrSub;
   late final MjpegFrameParser _mjpegParser;
-  Uint8List? _pendingFrame;
-  bool _decodingBusy = false;
+  FrameArchiveWriter? _archiveWriter;
+  File? _archiveFile;
+  String _archiveFilePath = '-';
+  bool _captureStopRequested = false;
+  bool _manifestProbeBusy = false;
   bool _running = false;
+  bool _capturing = false;
+  bool _analyzing = false;
   int _consecutiveMisses = 0;
   final int _globalRescanThreshold = 8;
   DateTime? _startedAt;
   int _inputFrames = 0;
-  int _droppedFrames = 0;
+  int _probeAttempts = 0;
+  int _probeHits = 0;
+  int _archiveWriteErrors = 0;
+  int _targetCaptureFrames = 0;
+  int _packetsPerLoopHint = 0;
   final List<int> _decodeCostsMs = <int>[];
 
   TransferAssembler? _assembler;
+  TransferManifest? _manifest;
   int? _activeTransferId;
   int _totalDataChunks = 0;
   int _decodedFrames = 0;
@@ -503,7 +580,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
 
   @override
   void dispose() {
-    _stopReceiver();
+    unawaited(_stopReceiver(analyzeAfterStop: false));
     _ffmpegController.dispose();
     _deviceController.dispose();
     _captureSizeController.dispose();
@@ -748,18 +825,29 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     }
     if (decodeFps < 3 || decodeFps > 30) {
       setState(() {
-        _status = '解码帧率建议 3-30。';
+        _status = '录制抽帧 FPS 建议 3-30。';
       });
       return;
     }
 
     _resetTransferState();
     await _startRuntimeLogSession();
-    _pendingFrame = null;
     _mjpegParser.reset();
     _startedAt = DateTime.now();
+    _captureStopRequested = false;
 
     try {
+      final Directory? sessionDir = _runtimeSessionDir;
+      if (sessionDir == null) {
+        throw StateError('runtime session dir is null');
+      }
+      final File archive = File(
+        '${sessionDir.path}${Platform.pathSeparator}capture_frames.cvar',
+      );
+      _archiveWriter = await FrameArchiveWriter.create(archive);
+      _archiveFile = archive;
+      _archiveFilePath = archive.path;
+
       _captureProcess = await Process.start(ffmpegPath, <String>[
         '-hide_banner',
         '-loglevel',
@@ -797,82 +885,122 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       unawaited(
         _captureProcess!.exitCode.then((int code) {
           _appendRuntimeLog('ffmpeg exited: $code');
-          if (!_running) {
+          if (_captureStopRequested || !_capturing) {
             return;
           }
-          if (mounted) {
-            setState(() {
-              _running = false;
-              _status = '采集中断：ffmpeg 已退出 ($code)';
-            });
-          }
+          unawaited(
+            _stopCaptureAndAnalyze(
+              reason: '采集中断：ffmpeg 已退出 ($code)',
+              analyzeAfterStop: _inputFrames > 0,
+            ),
+          );
         }),
       );
 
       _running = true;
-      _status = '接收中，等待有效帧...';
+      _capturing = true;
+      _analyzing = false;
+      _status = '录制中，等待清单帧（manifest）...';
       await _appendRuntimeLog(
-        'receiver started(pipe): ffmpeg=$ffmpegPath, device=$device, capture=$captureSize@$captureFps, decodeFps=$decodeFps',
+        'receiver started(capture): ffmpeg=$ffmpegPath, device=$device, capture=$captureSize@$captureFps, sampledFps=$decodeFps, archive=${archive.path}',
       );
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (e) {
       await _appendRuntimeLog('start receiver failed: $e');
-      setState(() {
-        _status = '启动 ffmpeg 失败: $e';
-      });
+      await _archiveWriter?.close();
+      _archiveWriter = null;
+      _archiveFile = null;
+      _archiveFilePath = '-';
+      if (mounted) {
+        setState(() {
+          _status = '启动 ffmpeg 失败: $e';
+          _running = false;
+          _capturing = false;
+          _analyzing = false;
+        });
+      }
     }
   }
 
   void _onMjpegFrame(Uint8List frameBytes) {
-    if (!_running) {
+    if (!_capturing) {
       return;
     }
     _inputFrames++;
     _latestCaptureBytes = frameBytes;
     _latestCaptureAt = DateTime.now();
-    if (_decodingBusy) {
-      _pendingFrame = frameBytes;
-      _droppedFrames++;
-      return;
+
+    final FrameArchiveWriter? writer = _archiveWriter;
+    if (writer != null) {
+      unawaited(
+        writer.append(frameBytes).catchError((Object e) async {
+          _archiveWriteErrors++;
+          await _appendRuntimeLog('archive append failed: $e');
+        }),
+      );
     }
-    unawaited(_decodeFrame(frameBytes));
+
+    final bool shouldProbe =
+        _manifest == null &&
+        !_manifestProbeBusy &&
+        (_inputFrames <= 8 || _inputFrames % 6 == 0);
+    if (shouldProbe) {
+      unawaited(_decodeFrameForProbe(frameBytes));
+    }
+
+    if (_targetCaptureFrames > 0 &&
+        _inputFrames >= _targetCaptureFrames &&
+        !_captureStopRequested) {
+      unawaited(
+        _stopCaptureAndAnalyze(reason: '已达到目标录制帧数 $_targetCaptureFrames'),
+      );
+    } else if (mounted && _inputFrames % 12 == 0) {
+      setState(() {});
+    }
   }
 
-  Future<void> _decodeFrame(Uint8List bytes) async {
-    if (!_running) {
+  Future<void> _decodeFrameForProbe(Uint8List bytes) async {
+    if (!_capturing || _manifestProbeBusy) {
       return;
     }
-    _decodingBusy = true;
+    _manifestProbeBusy = true;
+    _probeAttempts++;
+    try {
+      final DecodedFrameCandidate? decodedCandidate =
+          await _decodeVisualCandidate(bytes);
+      if (decodedCandidate == null) {
+        return;
+      }
+      _probeHits++;
+      _consecutiveMisses = 0;
+      _applyDecodedCandidateGeometry(decodedCandidate);
+      final VisualPacket packet = decodedCandidate.decoded.packet;
+      await _ingestManifestPacket(packet, capturePhase: true);
+    } finally {
+      _manifestProbeBusy = false;
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  Future<void> _decodeAndHandleFrame(Uint8List bytes) async {
+    if (!_analyzing) {
+      return;
+    }
     final Stopwatch sw = Stopwatch()..start();
     try {
       _decodedFrames++;
-      DecodedFrameCandidate? decodedCandidate;
-      if (_manualRegionEnabled) {
-        decodedCandidate = await VisualFrameSampler.decodeAtHint(
-          bytes,
-          centerXFraction: _manualCenterX,
-          centerYFraction: _manualCenterY,
-          widthFraction: _manualWidthFraction,
-        );
-      } else {
-        final Rect? hint = _lastDetectedNormalizedRect;
-        if (hint != null) {
-          final bool allowGlobal = _consecutiveMisses >= _globalRescanThreshold;
-          decodedCandidate = await VisualFrameSampler.decodeWithHint(
-            bytes,
-            normalizedHint: hint,
-            allowGlobalSearch: allowGlobal,
-          );
-        } else {
-          decodedCandidate = await VisualFrameSampler.decodeBestFrame(bytes);
-        }
-      }
+      final DecodedFrameCandidate? decodedCandidate =
+          await _decodeVisualCandidate(bytes);
       if (decodedCandidate == null) {
         _invalidFrames++;
         _consecutiveMisses++;
-        _lastDetectedNormalizedRect = _manualRegionEnabled
-            ? _manualNormalizedRect()
-            : _lastDetectedNormalizedRect;
+        if (_manualRegionEnabled) {
+          _lastDetectedNormalizedRect = _manualNormalizedRect();
+        }
         await _persistRuntimeFrame(
           bytes: bytes,
           valid: false,
@@ -880,31 +1008,237 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
         );
         return;
       }
-      _consecutiveMisses = 0;
-      _latestCaptureWidth = decodedCandidate.sourceWidth;
-      _latestCaptureHeight = decodedCandidate.sourceHeight;
-      _lastDetectedNormalizedRect = decodedCandidate.geometry.toNormalizedRect(
-        Size(
-          decodedCandidate.sourceWidth.toDouble(),
-          decodedCandidate.sourceHeight.toDouble(),
-        ),
-      );
       _validFrames++;
+      _consecutiveMisses = 0;
+      _applyDecodedCandidateGeometry(decodedCandidate);
       await _persistRuntimeFrame(
         bytes: bytes,
         valid: true,
         normalizedRect: _lastDetectedNormalizedRect,
       );
-      _handlePacket(decodedCandidate.decoded.packet);
+      await _handlePacket(decodedCandidate.decoded.packet);
     } finally {
       sw.stop();
       _recordDecodeCost(sw.elapsedMilliseconds);
-      _decodingBusy = false;
-      final Uint8List? pending = _pendingFrame;
-      _pendingFrame = null;
-      if (pending != null && _running) {
-        unawaited(_decodeFrame(pending));
+    }
+  }
+
+  Future<DecodedFrameCandidate?> _decodeVisualCandidate(Uint8List bytes) async {
+    if (_manualRegionEnabled) {
+      return VisualFrameSampler.decodeAtHint(
+        bytes,
+        centerXFraction: _manualCenterX,
+        centerYFraction: _manualCenterY,
+        widthFraction: _manualWidthFraction,
+      );
+    }
+    final Rect? hint = _lastDetectedNormalizedRect;
+    if (hint != null) {
+      final bool allowGlobal = _consecutiveMisses >= _globalRescanThreshold;
+      return VisualFrameSampler.decodeWithHint(
+        bytes,
+        normalizedHint: hint,
+        allowGlobalSearch: allowGlobal,
+      );
+    }
+    return VisualFrameSampler.decodeBestFrame(bytes);
+  }
+
+  void _applyDecodedCandidateGeometry(DecodedFrameCandidate decodedCandidate) {
+    _latestCaptureWidth = decodedCandidate.sourceWidth;
+    _latestCaptureHeight = decodedCandidate.sourceHeight;
+    _lastDetectedNormalizedRect = decodedCandidate.geometry.toNormalizedRect(
+      Size(
+        decodedCandidate.sourceWidth.toDouble(),
+        decodedCandidate.sourceHeight.toDouble(),
+      ),
+    );
+  }
+
+  int _fallbackPacketsPerLoop(int totalDataChunks) {
+    final int parityCount =
+        (totalDataChunks + VisualProtocol.dataPerGroup - 1) ~/
+        VisualProtocol.dataPerGroup;
+    return totalDataChunks +
+        parityCount +
+        VisualProtocol.manifestPacketsPerLoop;
+  }
+
+  int _fallbackCaptureFrames(int totalDataChunks) {
+    const int unknownRepeatSafety = 4;
+    return _fallbackPacketsPerLoop(totalDataChunks) *
+        VisualProtocol.recommendedCaptureLoops *
+        unknownRepeatSafety;
+  }
+
+  Future<void> _ingestManifestPacket(
+    VisualPacket packet, {
+    bool capturePhase = false,
+  }) async {
+    if (packet.isManifest) {
+      final TransferManifest? manifest = TransferManifest.unpack(
+        packet.payload,
+        transferId: packet.transferId,
+        payloadSize: packet.payloadSize,
+      );
+      if (manifest != null) {
+        _manifest = manifest;
+        _activeTransferId = manifest.transferId;
+        _totalDataChunks = manifest.totalDataChunks;
+        _packetsPerLoopHint = manifest.packetsPerLoop;
+        _targetCaptureFrames = math.max(
+          _inputFrames,
+          manifest.recommendedCaptureFrames,
+        );
+        if (capturePhase) {
+          _status = '已识别清单，目标录制 $_targetCaptureFrames 帧后自动转离线解析。';
+          await _appendRuntimeLog(
+            'manifest detected: transferId=${manifest.transferId}, totalChunks=${manifest.totalDataChunks}, packetsPerLoop=${manifest.packetsPerLoop}, targetFrames=${manifest.recommendedCaptureFrames}',
+          );
+        }
       }
+      _lastPacketInfo =
+          'M TID=${packet.transferId.toRadixString(16)} CH=${packet.totalDataChunks}';
+      return;
+    }
+
+    _activeTransferId ??= packet.transferId;
+    _totalDataChunks = packet.totalDataChunks;
+    _packetsPerLoopHint = _fallbackPacketsPerLoop(packet.totalDataChunks);
+    if (_targetCaptureFrames == 0) {
+      _targetCaptureFrames = _fallbackCaptureFrames(packet.totalDataChunks);
+      if (capturePhase) {
+        _status = '已识别首个数据包，按兜底策略录制 $_targetCaptureFrames 帧。';
+        await _appendRuntimeLog(
+          'fallback target frames: $_targetCaptureFrames (chunks=${packet.totalDataChunks})',
+        );
+      }
+    }
+  }
+
+  Future<void> _stopCaptureProcessOnly() async {
+    await _captureStdoutSub?.cancel();
+    _captureStdoutSub = null;
+    await _captureStderrSub?.cancel();
+    _captureStderrSub = null;
+
+    final Process? process = _captureProcess;
+    _captureProcess = null;
+    if (process != null) {
+      try {
+        process.kill(ProcessSignal.sigterm);
+      } catch (_) {
+        // ignore
+      }
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 2));
+      } catch (_) {
+        // ignore
+      }
+    }
+  }
+
+  Future<void> _stopReceiver({bool analyzeAfterStop = true}) async {
+    if (_capturing) {
+      await _stopCaptureAndAnalyze(
+        reason: '录制已停止',
+        analyzeAfterStop: analyzeAfterStop,
+      );
+      return;
+    }
+    if (_analyzing) {
+      _analyzing = false;
+      _running = false;
+      _status = '解析已停止。';
+      await _appendRuntimeLog('analysis stopped by user');
+      if (mounted) {
+        setState(() {});
+      }
+      return;
+    }
+    await _stopCaptureProcessOnly();
+    await _archiveWriter?.close();
+    _archiveWriter = null;
+  }
+
+  Future<void> _stopCaptureAndAnalyze({
+    required String reason,
+    bool analyzeAfterStop = true,
+  }) async {
+    if (!_capturing) {
+      return;
+    }
+    _captureStopRequested = true;
+    _capturing = false;
+    _status = '$reason，正在结束录制...';
+    await _appendRuntimeLog('capture stopping: $reason');
+    if (mounted) {
+      setState(() {});
+    }
+
+    await _stopCaptureProcessOnly();
+    await _archiveWriter?.close();
+    _archiveWriter = null;
+    _mjpegParser.reset();
+
+    if (!analyzeAfterStop) {
+      _running = false;
+      _status = '接收已停止。';
+      if (mounted) {
+        setState(() {});
+      }
+      return;
+    }
+
+    final File? archive = _archiveFile;
+    if (archive == null || !await archive.exists() || _inputFrames == 0) {
+      _running = false;
+      _status = '没有可解析的录制帧。';
+      if (mounted) {
+        setState(() {});
+      }
+      return;
+    }
+
+    _status = '录制完成，开始离线解析...';
+    _analyzing = true;
+    _decodedFrames = 0;
+    _validFrames = 0;
+    _invalidFrames = 0;
+    _decodeCostsMs.clear();
+    _runtimeFrameIndex = 0;
+    _savedFilePath = '';
+    _assembler = null;
+    _lastPacketInfo = '-';
+    _consecutiveMisses = 0;
+    if (mounted) {
+      setState(() {});
+    }
+
+    try {
+      await for (final Uint8List frame in FrameArchiveReader.readFrames(
+        archive,
+      )) {
+        if (!_analyzing) {
+          break;
+        }
+        await _decodeAndHandleFrame(frame);
+        if (_savedFilePath.isNotEmpty) {
+          break;
+        }
+        if (mounted && _decodedFrames % 12 == 0) {
+          setState(() {});
+        }
+      }
+      if (_savedFilePath.isEmpty) {
+        _status = '解析结束，但分片仍不完整。请提高重发系数或录制更多帧。';
+      }
+    } catch (e) {
+      _status = '离线解析失败: $e';
+      await _appendRuntimeLog('archive decode failed: $e');
+    } finally {
+      _analyzing = false;
+      _running = false;
       if (mounted) {
         setState(() {});
       }
@@ -939,14 +1273,6 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     return (count / sec).toStringAsFixed(2);
   }
 
-  String _dropRatePercent() {
-    if (_inputFrames <= 0) {
-      return '-';
-    }
-    final double rate = (_droppedFrames * 100.0) / _inputFrames;
-    return '${rate.toStringAsFixed(1)}%';
-  }
-
   String _avgDecodeMs() {
     if (_decodeCostsMs.isEmpty) {
       return '-';
@@ -964,7 +1290,49 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     return sorted[index].toString();
   }
 
+  String _receiverPhaseLabel() {
+    if (_capturing) {
+      return '录制中';
+    }
+    if (_analyzing) {
+      return '离线解析中';
+    }
+    if (_savedFilePath.isNotEmpty) {
+      return '已完成';
+    }
+    return '空闲';
+  }
+
+  double? _progressValue() {
+    if (_capturing) {
+      if (_targetCaptureFrames <= 0) {
+        return null;
+      }
+      return (_inputFrames / _targetCaptureFrames).clamp(0.0, 1.0);
+    }
+    if (_analyzing) {
+      final double p = _assembler?.progress ?? 0;
+      return p <= 0 ? null : p.clamp(0.0, 1.0);
+    }
+    if (_savedFilePath.isNotEmpty) {
+      return 1.0;
+    }
+    return 0.0;
+  }
+
+  String _progressText(double? progressValue) {
+    if (progressValue == null) {
+      return _capturing ? '等待清单帧...' : '-';
+    }
+    return '${(progressValue * 100).toStringAsFixed(1)}%';
+  }
+
   Future<void> _handlePacket(VisualPacket packet) async {
+    await _ingestManifestPacket(packet);
+    if (packet.isManifest) {
+      return;
+    }
+
     if (_activeTransferId == null || _activeTransferId != packet.transferId) {
       _activeTransferId = packet.transferId;
       _totalDataChunks = packet.totalDataChunks;
@@ -980,10 +1348,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       return;
     }
     assembler.accept(packet);
+    final String packetTag = packet.isParity ? 'P' : 'D';
     _lastPacketInfo =
-        '${packet.isParity ? 'P' : 'D'}#${packet.chunkIndex} G${packet.groupIndex} TID=${packet.transferId.toRadixString(16)}';
+        '$packetTag#${packet.chunkIndex} G${packet.groupIndex} TID=${packet.transferId.toRadixString(16)}';
     _status =
-        '接收中 ${assembler.receivedChunks}/${assembler.totalDataChunks} (${(assembler.progress * 100).toStringAsFixed(1)}%)';
+        '${_analyzing ? '离线解析' : '接收'} ${assembler.receivedChunks}/${assembler.totalDataChunks} (${(assembler.progress * 100).toStringAsFixed(1)}%)';
 
     if (assembler.isComplete && _savedFilePath.isEmpty) {
       final Uint8List? packed = assembler.buildPackedFile();
@@ -992,16 +1361,13 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
       }
       final FileEnvelope? envelope = FileEnvelope.unpack(packed);
       if (envelope == null) {
-        setState(() {
-          _status = '已收齐分片，但封包解析失败。';
-        });
+        _status = '已收齐分片，但封包解析失败。';
         return;
       }
       final String out = await _saveReceivedFile(envelope);
-      setState(() {
-        _savedFilePath = out;
-        _status = '传输完成，已保存文件。';
-      });
+      _savedFilePath = out;
+      _status = '传输完成，已保存文件。';
+      await _appendRuntimeLog('file saved: $out');
     }
   }
 
@@ -1020,32 +1386,26 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     return path;
   }
 
-  void _stopReceiver() {
-    _captureStdoutSub?.cancel();
-    _captureStdoutSub = null;
-    _captureStderrSub?.cancel();
-    _captureStderrSub = null;
-    _captureProcess?.kill(ProcessSignal.sigterm);
-    _captureProcess = null;
-    _pendingFrame = null;
-    _decodingBusy = false;
-    _mjpegParser.reset();
-    _appendRuntimeLog('receiver stopped');
-    if (_running) {
-      setState(() {
-        _running = false;
-        _status = '接收已停止。';
-      });
-    }
-  }
-
   void _resetTransferState() {
     _assembler = null;
+    _manifest = null;
     _activeTransferId = null;
     _totalDataChunks = 0;
     _decodedFrames = 0;
     _validFrames = 0;
     _invalidFrames = 0;
+    _probeAttempts = 0;
+    _probeHits = 0;
+    _archiveWriteErrors = 0;
+    _targetCaptureFrames = 0;
+    _packetsPerLoopHint = 0;
+    _archiveFile = null;
+    _archiveFilePath = '-';
+    _captureStopRequested = false;
+    _manifestProbeBusy = false;
+    _running = false;
+    _capturing = false;
+    _analyzing = false;
     _lastPacketInfo = '-';
     _savedFilePath = '';
     _latestCaptureBytes = null;
@@ -1056,21 +1416,20 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     _runtimeFrameIndex = 0;
     _consecutiveMisses = 0;
     _inputFrames = 0;
-    _droppedFrames = 0;
     _decodeCostsMs.clear();
     _startedAt = null;
   }
 
   @override
   Widget build(BuildContext context) {
-    final double progress = _assembler?.progress ?? 0;
+    final double? progressValue = _progressValue();
     return Padding(
       padding: const EdgeInsets.all(16),
       child: LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           final bool narrow = constraints.maxWidth < 1120;
-          final Widget left = _buildReceiverControls(progress);
-          final Widget right = _buildReceiverStatus(progress, narrow);
+          final Widget left = _buildReceiverControls(progressValue);
+          final Widget right = _buildReceiverStatus(progressValue, narrow);
           if (narrow) {
             return ListView(
               children: <Widget>[left, const SizedBox(height: 12), right],
@@ -1089,7 +1448,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     );
   }
 
-  Widget _buildReceiverControls(double progress) {
+  Widget _buildReceiverControls(double? progressValue) {
     final bool hasDevices = _videoDevices.isNotEmpty;
     final String? selected =
         hasDevices &&
@@ -1212,7 +1571,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
             TextField(
               controller: _decodeFpsController,
               enabled: !_running,
-              decoration: const InputDecoration(labelText: '解码 FPS'),
+              decoration: const InputDecoration(labelText: '录制抽帧 FPS'),
             ),
             const SizedBox(height: 10),
             TextField(
@@ -1232,45 +1591,63 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
                   child: FilledButton.icon(
                     onPressed: _running ? null : _startReceiver,
                     icon: const Icon(Icons.play_arrow),
-                    label: const Text('开始接收'),
+                    label: const Text('开始录制'),
                   ),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: OutlinedButton.icon(
-                    onPressed: _running ? _stopReceiver : null,
+                    onPressed: _running
+                        ? () => _stopReceiver(analyzeAfterStop: true)
+                        : null,
                     icon: const Icon(Icons.stop),
-                    label: const Text('停止'),
+                    label: Text(_analyzing ? '停止解析' : '停止并解析'),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 12),
+            _kv('阶段', _receiverPhaseLabel()),
             _kv('状态', _status),
-            _kv('采集链路', 'ffmpeg image2pipe (mjpeg)'),
+            _kv('采集链路', 'ffmpeg image2pipe + 本地帧归档'),
             _kv(
               '传输 ID',
               _activeTransferId == null
                   ? '-'
                   : _activeTransferId!.toRadixString(16),
             ),
+            _kv('清单文件', _manifest?.fileName ?? '-'),
+            _kv(
+              '清单长度',
+              _manifest == null
+                  ? '-'
+                  : '${_formatBytes(_manifest!.fileBytesLength)} (packed ${_formatBytes(_manifest!.packedBytesLength)})',
+            ),
             _kv('数据分片', _totalDataChunks == 0 ? '-' : '$_totalDataChunks'),
-            _kv('输入帧', '$_inputFrames (${_ratePerSec(_inputFrames)} fps)'),
-            _kv('解码帧', '$_decodedFrames'),
-            _kv('解码速率', '${_ratePerSec(_decodedFrames)} fps'),
+            _kv(
+              '目标录制帧',
+              _targetCaptureFrames <= 0 ? '等待清单帧' : '$_targetCaptureFrames',
+            ),
+            _kv('已录制帧', '$_inputFrames (${_ratePerSec(_inputFrames)} fps)'),
+            _kv('清单探测', '$_probeHits / $_probeAttempts'),
+            _kv('解析帧', '$_decodedFrames'),
             _kv('有效帧', '$_validFrames'),
-            _kv('有效速率', '${_ratePerSec(_validFrames)} fps'),
             _kv('无效帧', '$_invalidFrames'),
-            _kv('队列丢帧率', _dropRatePercent()),
             _kv('解码耗时', '${_avgDecodeMs()} ms (P95 ${_p95DecodeMs()} ms)'),
+            _kv(
+              '每轮帧数',
+              _packetsPerLoopHint == 0 ? '-' : '$_packetsPerLoopHint',
+            ),
+            _kv('归档文件', _archiveFilePath),
+            _kv('归档错误', '$_archiveWriteErrors'),
             _kv('已扫设备数', '${_videoDevices.length}'),
             _kv('日志目录', _runtimeLogDirPath),
             _kv('最后包', _lastPacketInfo),
             const SizedBox(height: 8),
-            LinearProgressIndicator(value: progress == 0 ? null : progress),
+            LinearProgressIndicator(value: progressValue),
             const SizedBox(height: 6),
             Text(
-              '${(progress * 100).toStringAsFixed(1)}%',
+              _progressText(progressValue),
               style: const TextStyle(fontWeight: FontWeight.w600),
             ),
           ],
@@ -1300,7 +1677,7 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
     );
   }
 
-  Widget _buildReceiverStatus(double progress, bool narrow) {
+  Widget _buildReceiverStatus(double? progressValue, bool narrow) {
     final String captureTime = _latestCaptureAt == null
         ? '-'
         : _latestCaptureAt!
@@ -1375,10 +1752,10 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
                 const SizedBox(height: 8),
                 Text(
                   _manualRegionEnabled
-                      ? '手动模式已启用，黄色框为手动码区。无效帧持续增长时请微调中心与宽度。'
+                      ? '手动模式已启用，黄色框为手动码区。录制阶段探测失败时请微调中心与宽度。'
                       : (_lastDetectedNormalizedRect == null
-                            ? '未识别到有效码区。请让发送端码图尽量充满采集画面，避免窗口边框与系统桌面占据主体。'
-                            : '黄色框为本帧实际命中的解码区域。'),
+                            ? '录制阶段只做轻量探测。即使现在未命中码区，离线解析仍会重新全量扫描。'
+                            : '黄色框为最近一次命中的码区。'),
                   style: const TextStyle(
                     color: Color(0xFF475569),
                     fontSize: 12.5,
@@ -1406,9 +1783,11 @@ class _ReceiverPanelState extends State<ReceiverPanel> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  progress >= 1 && _savedFilePath.isEmpty
-                      ? '分片齐全，但仍在处理封包。'
-                      : '',
+                  (_analyzing && _savedFilePath.isEmpty)
+                      ? '离线解析进行中：${_progressText(progressValue)}'
+                      : (_capturing && _targetCaptureFrames > 0
+                            ? '录制进度：${_progressText(progressValue)}'
+                            : ''),
                   style: const TextStyle(color: Color(0xFFB45309)),
                 ),
               ],
